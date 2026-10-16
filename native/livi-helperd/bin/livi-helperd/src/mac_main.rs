@@ -49,6 +49,9 @@ fn cp_config() -> (CpConfig, Identity) {
     let cp = CpConfig {
         ap_mac: Some(env_s("LIVI_CP_AP_MAC", "")).filter(|value|!value.is_empty()),
         ap_on_air: None,
+        wireless_handoff: if env_s("LIVI_CP_WIRELESS", "") == "1" {
+            livi_runtime::wireless_handoff::WirelessHandoff::new(&env_s("MACPLAY_RECEIVER_HOST", ""), &env_s("MACPLAY_RECEIVER_ALTERNATE_HOST", ""))
+        } else { None },
         wifi_iface: env_s("LIVI_WIFI_IFACE", "en0"),
         ssid: name.clone(),
         passphrase: env_s("LIVI_PASSPHRASE", ""),

@@ -12,3 +12,5 @@ test('30 and 60 failures never retry',async()=>{for(const fps of [30,60]){const 
 const {VideoWaitDeadline}=require('../../build/engine/frameRateFallback.js');
 test('final video wait expires once despite repeated negotiation',async()=>{let calls=0;const d=new VideoWaitDeadline(5,()=>calls++);d.arm();d.arm();await wait();d.arm();await wait();assert.equal(calls,1)});
 test('video or manual stop cancels final wait',async()=>{const d=new VideoWaitDeadline(5,()=>assert.fail());d.arm();d.cancel();d.arm();await wait()});
+
+test('decoder recovery failure reports whether frame-rate retry was scheduled',()=>{const calls=[];const high=new FrameRateFallback(120,f=>calls.push(f));assert.equal(high.failed(),false);high.negotiationStarted();assert.equal(high.failed(),true);assert.equal(high.failed(),false);assert.deepEqual(calls,[90]);const final=new FrameRateFallback(60,()=>assert.fail());final.negotiationStarted();assert.equal(final.failed(),false)});

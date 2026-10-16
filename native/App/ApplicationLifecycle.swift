@@ -41,6 +41,7 @@ import Combine
 
     func preferencesChanged() {
         guard let model else {return}
+        if model.settings.backgroundEnabled != true,model.settings.closeBehavior == "background" {model.settings.closeBehavior="ask"}
         model.persistPreferences()
         if model.settings.backgroundEnabled == true {
             if statusItem == nil {
@@ -108,10 +109,36 @@ import Combine
 
     func windowShouldClose(_ sender:NSWindow) -> Bool {
         guard sender === mainWindow,!terminating else {return true}
-        if model?.settings.backgroundEnabled == true {
-            sender.orderOut(nil)
-        } else {NSApp.terminate(nil)}
+        guard let model else {return true}
+        switch model.settings.closeBehavior ?? "ask" {
+        case "quit": NSApp.terminate(nil)
+        case "background": hideInBackground(sender,model:model)
+        default:
+            let alert=NSAlert()
+            alert.messageText=L("关闭MacPlay主窗口？")
+            alert.addButton(withTitle:L("保持后台运行"))
+            alert.addButton(withTitle:L("退出MacPlay"))
+            alert.addButton(withTitle:L("取消"))
+            alert.showsSuppressionButton=true
+            alert.suppressionButton?.title=L("记住我的选择")
+            alert.beginSheetModal(for:sender) { [weak self] response in
+                MainActor.assumeIsolated {
+                    guard response != .alertThirdButtonReturn else {return}
+                    let background=response == .alertFirstButtonReturn
+                    if alert.suppressionButton?.state == .on {
+                        model.settings.closeBehavior=background ? "background" : "quit"
+                        model.persistPreferences()
+                    }
+                    if background {self?.hideInBackground(sender,model:model)} else {NSApp.terminate(nil)}
+                }
+            }
+        }
         return false
+    }
+    private func hideInBackground(_ window:NSWindow,model:PlayModel) {
+        model.settings.backgroundEnabled=true
+        preferencesChanged()
+        window.orderOut(nil)
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool) -> Bool {
         // A Dock menu selection may also generate a reopen event. Preserve its target.

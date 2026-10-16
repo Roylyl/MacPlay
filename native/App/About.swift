@@ -55,7 +55,7 @@ struct GitHubRelease: Decodable {
         }
     }
     private let defaults = UserDefaults.standard
-    var currentVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2.2" }
+    var currentVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2.3" }
     var build: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "" }
     var architecture: String {
         #if arch(arm64)
@@ -135,13 +135,40 @@ struct GitHubRelease: Decodable {
             exportStatus = "日志已导出"
         } catch { exportStatus = "日志导出失败"; exportDetail = error.localizedDescription }
     }
-    static func redactedLog(_ raw: String) -> String {
-        raw.replacingOccurrences(of: NSHomeDirectory(), with: "~").components(separatedBy: .newlines).filter {
-            $0.range(of: #"(?i)password|passphrase|private.?key|certificate|pair.?record|ssid|payload=|hex=|token|identity\.pk8"#, options: .regularExpression) == nil
-        }.map {
-            $0.replacingOccurrences(of: #"(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-f]{8}-[0-9a-f-]{20,}\b|\b[0-9a-f]{24,}\b"#, with: "[redacted]", options: .regularExpression)
-        }.joined(separator: "\n")
+    func exportDiagnostics(_ model: PlayModel) {
+        exportDetail = ""
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        panel.nameFieldStringValue = "MacPlay-\(currentVersion)-\(stamp)-diagnostics.json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let raw = (try? String(contentsOf: model.logURL, encoding: .utf8)) ?? model.logs
+            // Deliberately omit settings, discovered phones and authentication
+            // data. Neither a network password nor a device UID is diagnostic.
+            let snapshot: [String: Any] = [
+                "schemaVersion": 1,
+                "application": "MacPlay",
+                "version": currentVersion,
+                "build": build,
+                "platform": "macOS",
+                "systemVersion": ProcessInfo.processInfo.operatingSystemVersionString,
+                "architecture": architecture,
+                "date": Date().ISO8601Format(),
+                "authenticationReady": model.credentialsReady,
+                "connection": ["running": model.running, "receivingOrWaiting": model.receivingOrWaiting,
+                               "mode": model.settings.wireless ? "wireless" : "USB", "status": model.status],
+                "metrics": model.mediaStatistics,
+                "messages": DiagnosticRedactor.redact(raw).components(separatedBy: .newlines)
+            ]
+            let safe = DiagnosticRedactor.redactValue(snapshot)
+            let data = try JSONSerialization.data(withJSONObject: safe, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            try data.write(to: url, options: .atomic)
+            exportStatus = "诊断快照已导出"
+        } catch { exportStatus = "诊断快照导出失败"; exportDetail = error.localizedDescription }
     }
+    static func redactedLog(_ raw: String) -> String { DiagnosticRedactor.redact(raw) }
+
 }
 
 struct MacPlayAboutView: View {
@@ -169,6 +196,7 @@ struct MacPlayAboutView: View {
             HStack {
                 Button(L("打开日志")) { NSWorkspace.shared.open(model.logURL) }.disabled(!FileManager.default.fileExists(atPath: model.logURL.path))
                 Button(L("导出日志")) { updates.exportLogs(model) }
+                Button(L("导出诊断快照")) { updates.exportDiagnostics(model) }
             }
             DisclosureGroup(L("最近日志")) {
                 ScrollView {

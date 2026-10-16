@@ -88,9 +88,10 @@ pub fn create_player(
     window_handle_buf: Buffer,
     codec_data: Option<Buffer>,
     plane_id: Option<u32>,
+    software: Option<bool>,
 ) -> Option<External<Plane>> {
     let cd: &[u8] = codec_data.as_ref().map_or(&[], |b| b.as_ref());
-    let player = Player::new(&codec, window_handle(&window_handle_buf), cd)?;
+    let player = Player::new_with_decoder(&codec, window_handle(&window_handle_buf), cd, software.unwrap_or(false))?;
     Some(External::new(Plane { id: plane_id, player: Arc::new(player) }))
 }
 
@@ -367,6 +368,11 @@ pub fn set_audio_receiver_volume(stream_id: u32, level: f64, ramp_ms: u32) {
 }
 
 #[napi]
+pub fn set_audio_receiver_device(stream_id:u32,device:Option<String>)->bool {
+    audio_recv::set_device(stream_id,device.as_deref())
+}
+
+#[napi]
 pub fn close_audio_receiver(stream_id: u32) {
     audio_recv::close(stream_id)
 }
@@ -409,6 +415,11 @@ pub fn open_mic_uplink(
         port: port as u16,
         label: String::from("mic"),
     }))
+}
+
+#[napi]
+pub fn set_mic_uplink_device(id:u32,device:Option<String>)->bool {
+    mic_uplink::set_device(id,device.as_deref())
 }
 
 #[napi]
@@ -507,6 +518,29 @@ pub fn decoded_video_size(plane: External<Plane>) -> Vec<u32> {
     let (width, height) = plane.player.decoded_size();
     vec![width, height]
 }
+
+#[napi(object)]
+pub struct VideoStatistics {
+    pub decoded_frames: f64,
+    pub errors: f64,
+    pub decoder: String,
+    pub software: bool,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[napi]
+pub fn decoded_video_statistics(plane: External<Plane>) -> VideoStatistics {
+    let (frames, errors, decoder, software) = plane.player.statistics();
+    let (width, height) = plane.player.decoded_size();
+    VideoStatistics { decoded_frames: frames as f64, errors: errors as f64, decoder: decoder.to_owned(), software, width, height }
+}
+
+#[napi]
+pub fn video_receiver_statistics(id: u32) -> Vec<f64> { screen_recv::statistics(id) }
+
+#[napi]
+pub fn restart_video_feed(id: u32) { feed::restart_video(id); }
 #[cfg(target_os="macos")]
 #[napi]
 pub fn macplay_prepare_video_window(aspect:f64) -> Buffer {

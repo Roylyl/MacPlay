@@ -44,6 +44,11 @@ struct Ear {
     retired: Arc<AtomicBool>,
     forwarded: Arc<AtomicU64>,
     rejected: Arc<AtomicU64>,
+    codec: &'static str,
+    sample_rate: u32,
+    channels: u8,
+    latency_ms: u32,
+    realtime: bool,
 }
 static EARS: OnceLock<Mutex<HashMap<u32, Ear>>> = OnceLock::new();
 
@@ -72,7 +77,9 @@ pub fn open(cfg: &AudioConfig, key: [u8; 32], on_started: StartedCb) -> Option<(
             return None;
         }
     };
-    ears().lock().unwrap_or_else(|e| e.into_inner()).insert(out.id, Ear{_receiver:recv,stats,retired,forwarded,rejected});
+    ears().lock().unwrap_or_else(|e| e.into_inner()).insert(out.id, Ear{_receiver:recv,stats,retired,forwarded,rejected,
+        codec:match cfg.codec {livi_audio_stream::Codec::AacLc=>"AAC-LC",livi_audio_stream::Codec::Opus=>"Opus",livi_audio_stream::Codec::Lpcm|livi_audio_stream::Codec::PcmLe=>"PCM"},
+        sample_rate:cfg.clock_rate,channels:cfg.channels,latency_ms:cfg.latency_ms,realtime:cfg.realtime});
     eprintln!("[cp_audio] stream 0x{:x} open ({:?})", out.id, cfg.codec);
     eprintln!("[cp_audio] id={} rate={} channels={} dataPort={} controlPort={} latencyMs={}",out.id,cfg.clock_rate,cfg.channels,data_port,control_port,cfg.latency_ms);
     Some((out.id, data_port, control_port))
@@ -90,6 +97,10 @@ pub fn set_volume(id: u32, level: f64, ramp_ms: u32) {
     }
 }
 
+pub fn set_device(id:u32,device:Option<&str>)->bool {
+    feed::audio_out(id).is_some_and(|out|out.player.set_device(device))
+}
+
 pub fn close(id: u32) {
     eprintln!("[cp_audio] stream 0x{id:x} close");
     let ear=ears().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -102,11 +113,19 @@ pub fn close(id: u32) {
 
 pub fn statistics() -> String {
     let ears=ears().lock().unwrap_or_else(|e|e.into_inner());
+    let number=|value:Option<u64>|value.map(|v|v.to_string()).unwrap_or("null".into());
+    let millis=|value:Option<u64>|value.map(|v|format!("{:.3}",v as f64/1_000_000.0)).unwrap_or("null".into());
     let rows:Vec<String>=ears.iter().map(|(id,ear)|{
         let s=&ear.stats;
-        let (decoded,errors)=feed::audio_out(*id).map(|o|o.player.statistics()).unwrap_or_default();
-        format!("{{\"id\":{id},\"packets\":{},\"bytes\":{},\"decrypted\":{},\"invalid\":{},\"authenticationErrors\":{},\"forwarded\":{},\"rejected\":{},\"decodedBuffers\":{decoded},\"pipelineErrors\":{errors},\"silenceMs\":{}}}",
-            s.packets.load(Ordering::Relaxed),s.bytes.load(Ordering::Relaxed),s.decrypted.load(Ordering::Relaxed),s.invalid.load(Ordering::Relaxed),s.authentication_errors.load(Ordering::Relaxed),ear.forwarded.load(Ordering::Relaxed),ear.rejected.load(Ordering::Relaxed),s.silence_ms().map(|v|v.to_string()).unwrap_or("null".into()))
+        let p=feed::audio_out(*id).map(|o|o.player.statistics()).unwrap_or_default();
+        format!(concat!("{{\"id\":{id},\"codec\":\"{}\",\"sampleRate\":{},\"channels\":{},\"latencyMs\":{},\"realtime\":{},",
+            "\"packets\":{},\"bytes\":{},\"decrypted\":{},\"invalid\":{},\"authenticationErrors\":{},\"forwarded\":{},\"rejected\":{},",
+            "\"decodedBuffers\":{},\"pipelineErrors\":{},\"silenceMs\":{},\"jitterLost\":{},\"jitterLate\":{},\"jitterDuplicates\":{},",
+            "\"averageJitterMs\":{},\"queueBufferMs\":{},\"clockLatencyMs\":{},\"playoutLeadMs\":{},\"lateBuffers\":{},\"deviceRestarts\":{}}}"),
+            ear.codec,ear.sample_rate,ear.channels,ear.latency_ms,ear.realtime,
+            s.packets.load(Ordering::Relaxed),s.bytes.load(Ordering::Relaxed),s.decrypted.load(Ordering::Relaxed),s.invalid.load(Ordering::Relaxed),s.authentication_errors.load(Ordering::Relaxed),ear.forwarded.load(Ordering::Relaxed),ear.rejected.load(Ordering::Relaxed),p.decoded_buffers,p.pipeline_errors,s.silence_ms().map(|v|v.to_string()).unwrap_or("null".into()),
+            number(p.jitter_lost),number(p.jitter_late),number(p.jitter_duplicates),millis(p.average_jitter_ns),millis(p.queue_buffer_ns),millis(p.clock_latency_ns),
+            p.playout_lead_ns.map(|v|format!("{:.3}",v as f64/1_000_000.0)).unwrap_or("null".into()),p.late_buffers,p.device_restarts,id=id)
     }).collect();
     format!("[{}]",rows.join(","))
 }

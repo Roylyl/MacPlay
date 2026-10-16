@@ -10,7 +10,7 @@ for arch in "${ARCHES[@]}"; do
   if [[ "$arch" == x86_64 ]]; then triple=x86_64-apple-darwin; node_arch=x64; fi
   stage="build/architectures/$arch"
   mkdir -p "$stage"
-  swiftc -parse-as-library -O -target "$arch-apple-macosx14.0" -framework SwiftUI -framework AppKit -framework CoreWLAN -framework CoreLocation -framework IOKit -framework IOBluetooth -framework CoreAudio -framework MediaPlayer native/App/MacPlay.swift native/App/ApplicationLifecycle.swift native/App/About.swift native/App/Localization.swift native/App/ConnectionPolicy.swift native/App/NowPlayingState.swift native/App/NowPlayingFeed.swift -o "$stage/MacPlay"
+  swiftc -parse-as-library -O -target "$arch-apple-macosx14.0" -framework SwiftUI -framework AppKit -framework CoreWLAN -framework SystemConfiguration -framework CoreLocation -framework IOKit -framework IOBluetooth -framework CoreAudio -framework MediaPlayer native/App/MacPlay.swift native/App/ApplicationLifecycle.swift native/App/About.swift native/App/Localization.swift native/App/ConnectionPolicy.swift native/App/AudioHardwareMonitor.swift native/App/DiagnosticRedactor.swift native/App/ReceiverCommandPipe.swift native/App/SystemQuery.swift native/App/DisplayCapabilities.swift native/App/NetworkInterfaces.swift native/App/NowPlayingState.swift native/App/NowPlayingFeed.swift -o "$stage/MacPlay"
   clang -fobjc-arc -arch "$arch" -mmacosx-version-min=14.0 -framework Foundation -framework AppKit -framework IOBluetooth -sectcreate __TEXT __info_plist native/macplay-bluetooth/Info.plist native/macplay-bluetooth/main.m -o "$stage/macplay-bluetooth"
   node scripts/build-native.mjs "--arch=$node_arch"
   cp native/livi-crypto/build/Release/livi_crypto.node native/livi-gst-video/build/Release/gst_video.node "$stage/"

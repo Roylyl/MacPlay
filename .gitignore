@@ -1,21 +1,69 @@
+# Dependencies and generated builds
 node_modules/
+.pnpm-store/
 build/
 dist/
+target/
+.build/
+.swiftpm/
+DerivedData/
 *.tsbuildinfo
-.DS_Store
-**/target/
-**/build/
+*.dSYM/
 native/macplay-bluetooth/macplay-bluetooth
-**/identity.pk8
-**/certificate.p7b
-**/authentication/
-*.log
-*.dmg
+
+# Locally prepared runtime libraries
 assets/gstreamer/macos-x64
 assets/gstreamer/**/lib/*.dylib
 assets/gstreamer/**/lib/gstreamer-1.0/
 
-# Explicit 1.1.0 bundled authentication inputs
+# Installer and export output
+*.dmg
+*.pkg
+*.app/
+/MacPlay-*.zip
+/exports/
+/diagnostics/
+/MacPlay-*-logs*.txt
+/MacPlay-*-diagnostics.json
+/coverage/
+/.nyc_output/
+
+# Runtime settings, logs and local credentials
+/settings.json
+/session-settings.json
+/runtime/
+/logs/
+*.log
+*.sock
+.env
+.env.*
+!.env.example
+!.env.sample
+*.p12
+*.pfx
+*.keychain
+*.keychain-db
+**/identity.pk8
+**/certificate.p7b
+**/authentication/
+
+# Deliberately bundled authentication inputs and provenance
 !assets/authentication/
+assets/authentication/*
 !assets/authentication/identity.pk8
 !assets/authentication/certificate.p7b
+!assets/authentication/SOURCE.txt
+
+# macOS, editor and temporary files
+.DS_Store
+._*
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*.xcuserstate
+xcuserdata/
+*~
+/.cache/
+/.tmp/

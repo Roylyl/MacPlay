@@ -41,6 +41,8 @@ pub struct CpConfig {
     pub ap_mac: Option<String>,
     /// Asks an access point that is not this host's for the SSID and channel it is on air with.
     pub ap_on_air: Option<AskOnAir>,
+    /// Mac wireless receiver addresses and cancellation shared with the control socket.
+    pub wireless_handoff: Option<crate::wireless_handoff::WirelessHandoff>,
 }
 
 pub type AskOnAir = fn() -> Option<(String, u8)>;
@@ -274,7 +276,8 @@ fn carplay_start_session(cp: &CpConfig, live: OnAir) -> Option<CarPlayStartSessi
             source_version: Some(cp.source_version.clone()),
         });
     }
-    let fe80 = net::wlan_link_local(&cp.wifi_iface)?;
+    let receiver = cp.wireless_handoff.as_ref().map(|handoff| handoff.receiver_host())
+        .or_else(|| net::wlan_link_local(&cp.wifi_iface))?;
     let (live_ssid, live_channel) = live;
     let ssid = live_ssid
         .filter(|s| !s.is_empty())
@@ -286,7 +289,7 @@ fn carplay_start_session(cp: &CpConfig, live: OnAir) -> Option<CarPlayStartSessi
             wifi_ssid: Some(ssid),
             passphrase: Some(cp.passphrase.clone()),
             channel: Some(channel),
-            ip_address: vec![fe80],
+            ip_address: vec![receiver],
             security_type: Some(cp.security_type as u8),
         }),
         port: Some(cp.airplay_port),
@@ -400,8 +403,31 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
     let mut duration: Option<u32>=None;
     let mut location_types = LocationTypes::default();
     let mut status_wanted = false;
+    let handoff = (cp.transport == Transport::Wireless).then(|| cp.wireless_handoff.clone()).flatten();
+    let mut connection_updates = handoff.as_ref().map(|h| h.connection_updates())
+        .unwrap_or_else(|| tokio::sync::watch::channel(false).1);
+    let mut connection_feed_open = handoff.is_some();
+    let mut fallback_deadline: Option<Instant> = None;
+    let mut fallback_message: Option<CarPlayStartSession> = None;
     loop {
         let frame = tokio::select! {
+            changed = connection_updates.changed(), if connection_feed_open => {
+                if changed.is_err() { connection_feed_open = false; }
+                if *connection_updates.borrow_and_update() {
+                    fallback_deadline = None;
+                    fallback_message = None;
+                }
+                continue;
+            }
+            _ = tokio::time::sleep_until(fallback_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))), if fallback_deadline.is_some() => {
+                fallback_deadline = None;
+                if let (Some(mut start), Some(address)) = (fallback_message.take(), handoff.as_ref().and_then(|h| h.take_alternate())) {
+                    if let Some(wireless) = &mut start.wireless_attributes { wireless.ip_address = vec![address]; }
+                    if ch.send(start.encode()).await.is_err() { break; }
+                    println!("[cp] CarPlayStartSession alternate address sent (IPv6)");
+                }
+                continue;
+            }
             frame = ch.recv() => match frame {
                 Some(frame) => frame,
                 None => break,
@@ -518,11 +544,15 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
                         if ch.send(start.encode()).await.is_err() {
                             break;
                         }
+                        if fallback_deadline.is_none() {
+                            fallback_deadline = handoff.as_ref().and_then(|h| h.retry_deadline());
+                            if fallback_deadline.is_some() { fallback_message = Some(start); }
+                        }
                         let _ = events.send(BringupEvent::CarPlayStartSent).await;
                     }
                     None => {
                         let iface = if cp.transport == Transport::Wired { cp.av_iface.as_deref().unwrap_or("<missing USB interface>") } else { &cp.wifi_iface };
-                        let why = format!("no link-local on {iface:?}");
+                        let why = format!("no usable receiver address on {iface:?}");
                         println!("[cp] CarPlayStartSession not sent: {why}");
                         let _ = events.send(BringupEvent::Failed(why)).await;
                     }
@@ -587,7 +617,21 @@ mod tests {
             available_current_ma: 500,
             ap_mac: None,
             ap_on_air: Some(ask),
+            wireless_handoff: None,
         }
+    }
+
+    #[test]
+    fn wireless_handoff_uses_selected_primary_but_never_overrides_wired_usb() {
+        let mut cp = dongle_ap(|| None);
+        cp.wifi_iface = "missing-test-interface".into();
+        cp.wireless_handoff = crate::wireless_handoff::WirelessHandoff::new("192.0.2.10", "fe80::10");
+        let start = carplay_start_session(&cp, (None, None)).unwrap();
+        assert_eq!(start.wireless_attributes.unwrap().ip_address, vec!["192.0.2.10"]);
+        assert!(start.wired_attributes.is_none());
+        cp.transport = Transport::Wired;
+        // USB interface is absent: the wireless address must not substitute for it.
+        assert!(carplay_start_session(&cp, (None, None)).is_none());
     }
 
     #[tokio::test]

@@ -265,6 +265,10 @@ where
         }
         // Profiles are registered at startup and stay up; the toggles are accepted no-ops.
         "set-cp" | "set-aa" => reply(&mut stream, "{\"ok\":true}").await,
+        "network-connected" => {
+            if let Some(handoff) = &cfg.cp.wireless_handoff { handoff.network_connected(); }
+            reply(&mut stream, "{\"ok\":true}").await
+        }
         "seek" => {
             let json=match state.vehicle().push_seek(arg) {Ok(())=>"{\"ok\":true}".to_string(),Err(e)=>err_json(&e)};
             reply(&mut stream,&json).await

@@ -15,7 +15,7 @@ use gstreamer_controller::prelude::*;
 
 use livi_audio_stream::{reframe_aac, rtp_caps, Codec, RTP_HEADER_LEN};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
 /// What a stream needs to build its pipeline.
@@ -37,12 +37,12 @@ pub struct Config {
 fn decoder_chain(codec: Codec) -> Option<&'static str> {
     match codec {
         Codec::Lpcm | Codec::PcmLe => None,
-        Codec::Opus => Some("rtpjitterbuffer latency={latency} ! rtpopusdepay ! opusdec"),
+        Codec::Opus => Some("rtpjitterbuffer latency={latency} name=jitter ! rtpopusdepay ! opusdec"),
         #[cfg(target_os = "linux")]
-        Codec::AacLc => Some("rtpjitterbuffer latency={latency} ! rtpmp4gdepay ! aacparse ! faad"),
+        Codec::AacLc => Some("rtpjitterbuffer latency={latency} name=jitter ! rtpmp4gdepay ! aacparse ! faad"),
         #[cfg(not(target_os = "linux"))]
         Codec::AacLc => {
-            Some("rtpjitterbuffer latency={latency} ! rtpmp4gdepay ! aacparse ! avdec_aac")
+            Some("rtpjitterbuffer latency={latency} name=jitter ! rtpmp4gdepay ! aacparse ! avdec_aac")
         }
     }
 }
@@ -77,9 +77,9 @@ pub fn pipeline_desc(cfg: &Config) -> String {
     };
     format!(
         "appsrc name=src is-live=true format=time do-timestamp=true ! \
-         {head}audioconvert ! clocksync sync=true ! volume name=vol ! \
+         {head}audioconvert ! clocksync name=playout-clock sync=true ! volume name=vol ! \
          audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! \
-         queue ! {sink}",
+         queue name=output-queue ! {sink}",
         sink = sink_chain(cfg),
     )
 }
@@ -91,9 +91,29 @@ struct VizAcc {
     rate: u32,
 }
 
+/// Statistics read from the pipeline; missing fields stay unknown, not zero.
+#[derive(Default)]
+pub struct Statistics {
+    pub decoded_buffers: u64,
+    pub pipeline_errors: u64,
+    pub jitter_lost: Option<u64>,
+    pub jitter_late: Option<u64>,
+    pub jitter_duplicates: Option<u64>,
+    pub average_jitter_ns: Option<u64>,
+    pub queue_buffer_ns: Option<u64>,
+    pub playout_lead_ns: Option<i64>,
+    pub clock_latency_ns: Option<u64>,
+    pub late_buffers: u64,
+    pub device_restarts: u64,
+}
+
 pub struct Player {
     decoded: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
+    playout_lead_ns: Arc<AtomicI64>,
+    clock_latency_ns: Arc<AtomicU64>,
+    late_buffers: Arc<AtomicU64>,
+    device_restarts: AtomicU64,
     pipeline: gst::Pipeline,
     appsrc: gst_app::AppSrc,
     volume: gst::Element,
@@ -143,6 +163,32 @@ impl Player {
 
         let decoded=Arc::new(AtomicU64::new(0));
         let errors=Arc::new(AtomicU64::new(0));
+        let playout_lead_ns=Arc::new(AtomicI64::new(i64::MIN));
+        let late_buffers=Arc::new(AtomicU64::new(0));
+        let clock_latency_ns=Arc::new(AtomicU64::new(u64::MAX));
+        // Segment running time + the queried upstream latency - current time.
+        // This follows clocksync scheduling, not acoustic or network latency.
+        if let Some(pad)=pipeline.by_name("playout-clock").and_then(|e|e.static_pad("sink")) {
+            let weak=pipeline.downgrade();
+            let lead=playout_lead_ns.clone();
+            let late=late_buffers.clone();
+            let latency=clock_latency_ns.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER,move |pad,info|{
+                let latency=latency.load(Ordering::Relaxed);
+                if latency!=u64::MAX
+                    && let Some(pts)=info.buffer().and_then(|b|b.pts())
+                    && let Some(event)=pad.sticky_event::<gst::event::Segment>(0)
+                    && let Some(segment)=event.segment().downcast_ref::<gst::ClockTime>()
+                    && let Some(running)=segment.to_running_time(pts)
+                    && let Some(now)=weak.upgrade().and_then(|p|p.current_running_time()) {
+                    let delta=(i128::from(running.nseconds())+i128::from(latency)-i128::from(now.nseconds()))
+                        .clamp(i128::from(i64::MIN)+1,i128::from(i64::MAX)) as i64;
+                    lead.store(delta,Ordering::Relaxed);
+                    if delta < -20_000_000 {late.fetch_add(1,Ordering::Relaxed);}
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
         let visualizer_enabled = Arc::new(AtomicBool::new(false));
         let visualizer: Arc<Mutex<VizAcc>> = Default::default();
         // Pre-fader tap: mix each buffer to mono, hold ~200ms.
@@ -201,12 +247,12 @@ impl Player {
                     errors.fetch_add(1,Ordering::Relaxed);
                     eprintln!("[cp_audio:{label}] {} | {}", e.error(), e.debug().unwrap_or_default());
                 }
-                gst::BusSyncReply::Pass
+                gst::BusSyncReply::Drop
             });
         }
 
         Some(Self {
-            decoded,errors,
+            decoded,errors,playout_lead_ns,clock_latency_ns,late_buffers,device_restarts:AtomicU64::new(0),
             pipeline,
             appsrc,
             volume,
@@ -218,7 +264,46 @@ impl Player {
         })
     }
 
-    pub fn statistics(&self) -> (u64,u64) {(self.decoded.load(Ordering::Relaxed),self.errors.load(Ordering::Relaxed))}
+    pub fn statistics(&self) -> Statistics {
+        // Query on the low-frequency statistics tick, never on the audio thread.
+        if let Some(pad)=self.pipeline.by_name("playout-clock").and_then(|e|e.static_pad("sink")) {
+            let mut query=gst::query::Latency::new();
+            if pad.peer_query(&mut query) {
+                let (live,min,_)=query.result();
+                self.clock_latency_ns.store(if live {min.nseconds()}else{0},Ordering::Relaxed);
+            }
+        }
+        let jitter=self.pipeline.by_name("jitter").map(|e|e.property::<gst::Structure>("stats"));
+        let field=|name:&str|jitter.as_ref().and_then(|s|s.get::<u64>(name).ok());
+        let lead=self.playout_lead_ns.load(Ordering::Relaxed);
+        let latency=self.clock_latency_ns.load(Ordering::Relaxed);
+        Statistics {
+            decoded_buffers:self.decoded.load(Ordering::Relaxed),
+            pipeline_errors:self.errors.load(Ordering::Relaxed),
+            jitter_lost:field("num-lost"), jitter_late:field("num-late"),
+            jitter_duplicates:field("num-duplicates"), average_jitter_ns:field("avg-jitter"),
+            queue_buffer_ns:self.pipeline.by_name("output-queue").map(|e|e.property::<u64>("current-level-time")),
+            playout_lead_ns:(lead!=i64::MIN).then_some(lead),
+            clock_latency_ns:(latency!=u64::MAX).then_some(latency),
+            late_buffers:self.late_buffers.load(Ordering::Relaxed),
+            device_restarts:self.device_restarts.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Restart only the output pipeline; the receiver, ports and stream ID stay.
+    pub fn set_device(&self,device:Option<&str>)->bool {
+        if self.pipeline.set_state(gst::State::Null).is_err(){return false}
+        let Some(sink)=self.pipeline.by_name(SINK_NAME) else{return false};
+        let (_,property)=audio_sink();
+        sink.set_property(property,device.filter(|d|!d.is_empty()));
+        self.playout_lead_ns.store(i64::MIN,Ordering::Relaxed);
+        self.clock_latency_ns.store(u64::MAX,Ordering::Relaxed);
+        // Remove an in-flight volume ramp from the old pipeline clock.
+        self.volume.set_control_binding_disabled("volume",true);
+        if self.pipeline.set_state(gst::State::Playing).is_err(){return false}
+        self.device_restarts.fetch_add(1,Ordering::Relaxed);
+        true
+    }
 
     /// Toggles the tap; off clears what was held.
     pub fn set_visualizer_enabled(&self, on: bool) {

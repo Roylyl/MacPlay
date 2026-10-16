@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -19,10 +19,21 @@ pub type ConfigCb = Box<dyn Fn(CpCodec, Vec<u8>) + Send + 'static>;
 
 const IDLE: Duration = Duration::from_millis(20);
 
+#[derive(Default)]
+struct Receiver {
+    stop: AtomicBool,
+    connected: AtomicBool,
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    connections: AtomicU64,
+    disconnects: AtomicU64,
+    last_disconnect_frames: AtomicU64,
+}
+
 struct Sink {
     id: u32,
     /// Set once this receiver is retired; a replacement owns the plane from then on.
-    stop: Arc<AtomicBool>,
+    receiver: Arc<Receiver>,
     on_config: ConfigCb,
     /// The config the main process has; the phone repeats it, the plane is built once.
     reported: Option<(CpCodec, Vec<u8>)>,
@@ -30,7 +41,7 @@ struct Sink {
 
 impl Sink {
     fn retired(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
+        self.receiver.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -56,16 +67,28 @@ impl ScreenSink for Sink {
             return;
         }
         crate::VIDEO_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+        self.receiver.frames.fetch_add(1, Ordering::Relaxed);
+        self.receiver.bytes.fetch_add(nal.len() as u64, Ordering::Relaxed);
         feed::push_video(self.id, nal);
     }
 
     fn on_started(&mut self) {}
 }
 
-static RECEIVERS: OnceLock<Mutex<HashMap<u32, Arc<AtomicBool>>>> = OnceLock::new();
+static RECEIVERS: OnceLock<Mutex<HashMap<u32, Arc<Receiver>>>> = OnceLock::new();
 
-fn receivers() -> &'static Mutex<HashMap<u32, Arc<AtomicBool>>> {
+fn receivers() -> &'static Mutex<HashMap<u32, Arc<Receiver>>> {
     RECEIVERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per receiver, so a retired stream or second control connection cannot affect health checks.
+pub fn statistics(id: u32) -> Vec<f64> {
+    let receivers = receivers().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = receivers.get(&id) else { return Vec::new() };
+    vec![r.frames.load(Ordering::Relaxed) as f64, r.bytes.load(Ordering::Relaxed) as f64,
+        u8::from(r.connected.load(Ordering::Relaxed)) as f64,
+        r.connections.load(Ordering::Relaxed) as f64, r.disconnects.load(Ordering::Acquire) as f64,
+        r.last_disconnect_frames.load(Ordering::Relaxed) as f64]
 }
 
 /// Dual stack: the phone may reach us over either family.
@@ -86,15 +109,15 @@ pub fn open(id: u32, key: [u8; 32], on_config: ConfigCb) -> std::io::Result<u16>
     let port = listener.local_addr()?.port();
     listener.set_nonblocking(true)?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    receivers().lock().unwrap_or_else(|e| e.into_inner()).insert(id, stop.clone());
+    let receiver = Arc::new(Receiver::default());
+    receivers().lock().unwrap_or_else(|e| e.into_inner()).insert(id, receiver.clone());
 
     std::thread::Builder::new().name(format!("livi-cp-screen-{id}")).spawn(move || {
         // Built here: the sink behind ScreenStream is not Send, so it stays on this thread.
         let mut stream =
-            ScreenStream::new(key, Box::new(Sink { id, stop: stop.clone(), on_config, reported: None }));
+            ScreenStream::new(key, Box::new(Sink { id, receiver: receiver.clone(), on_config, reported: None }));
         let mut chunk = vec![0u8; 65536];
-        while !stop.load(Ordering::Relaxed) {
+        while !receiver.stop.load(Ordering::Relaxed) {
             let Ok((client, _)) = listener.accept() else {
                 std::thread::sleep(IDLE);
                 continue;
@@ -105,14 +128,16 @@ pub fn open(id: u32, key: [u8; 32], on_config: ConfigCb) -> std::io::Result<u16>
             let _ = client.set_nonblocking(false);
             let _ = client.set_read_timeout(Some(IDLE));
             stream.reset();
+            receiver.connections.fetch_add(1, Ordering::Relaxed);
+            receiver.connected.store(true, Ordering::Release);
             eprintln!("[cp_screen] video data connection accepted");
             let mut client = client;
-            while !stop.load(Ordering::Relaxed) {
+            while !receiver.stop.load(Ordering::Relaxed) {
                 match client.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
                         if stream.push(&chunk[..n]).is_err() {
-                            break; // implausible body size: the connection is not ours
+                            break; // Fatal framing/authentication error: close TCP so recovery can restart it.
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -120,6 +145,9 @@ pub fn open(id: u32, key: [u8; 32], on_config: ConfigCb) -> std::io::Result<u16>
                     Err(_) => break,
                 }
             }
+            receiver.connected.store(false, Ordering::Release);
+            receiver.last_disconnect_frames.store(receiver.frames.load(Ordering::Relaxed), Ordering::Relaxed);
+            receiver.disconnects.fetch_add(1, Ordering::Release);
             eprintln!("[cp_screen] video data connection closed");
         }
     })?;
@@ -127,8 +155,8 @@ pub fn open(id: u32, key: [u8; 32], on_config: ConfigCb) -> std::io::Result<u16>
 }
 
 pub fn close(id: u32) {
-    if let Some(stop) = receivers().lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-        stop.store(true, Ordering::Relaxed);
+    if let Some(receiver) = receivers().lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+        receiver.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -226,5 +254,27 @@ mod tests {
         let second = open(0xdead_0002, KEY, Box::new(|_, _| {})).unwrap();
         assert_ne!(first, second, "each open binds its own port");
         close(0xdead_0002);
+    }
+
+    #[test]
+    fn transport_health_is_scoped_to_the_current_receiver() {
+        let id = 0xdead_0005;
+        let port = open(id, KEY, Box::new(|_, _| {})).unwrap();
+        let client = connect(port);
+        for _ in 0..100 {
+            if statistics(id)[2] == 1.0 { break; }
+            std::thread::sleep(IDLE);
+        }
+        assert_eq!(&statistics(id)[2..5], &[1.0, 1.0, 0.0]);
+        drop(client);
+        for _ in 0..100 {
+            if statistics(id)[4] == 1.0 { break; }
+            std::thread::sleep(IDLE);
+        }
+        assert_eq!(&statistics(id)[2..5], &[0.0, 1.0, 1.0]);
+        let _replacement = open(id, KEY, Box::new(|_, _| {})).unwrap();
+        assert_eq!(statistics(id), vec![0.0; 6]);
+        close(id);
+        assert!(statistics(id).is_empty());
     }
 }

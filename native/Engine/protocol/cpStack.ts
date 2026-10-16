@@ -16,7 +16,6 @@ import {
   closeAudioReceiver,
   closeMicUplink,
   closeScreenReceiver,
-  onAudioReceiverStarted,
   openAudioReceiver,
   openMicUplink,
   openScreenReceiver,
@@ -193,6 +192,8 @@ interface CpSession {
   lastMediaReadNs?: bigint
   mediaCounts?: number[]
   heartbeatEstablished?: boolean
+  lastHeartbeatCheckNs?: bigint
+  heartbeatResumedNs?: bigint
   lastCtrlReadNs: bigint
   heartbeat: ReturnType<typeof setInterval> | null
 }
@@ -221,21 +222,21 @@ export class CpStack extends EventEmitter {
   private _speechActive = false
   /** True while this phone is the one whose audio reaches the sink. */
   private _audioActive = false
+  private _audioDeviceRevision = 0
   /** The host's audio streams, so its start report finds the right stream. */
   private readonly _audioById = new Map<
     number,
-    { prof: CpAudioProfile; inProcess: boolean; started: (firstSample: number) => void }
+    { prof: CpAudioProfile; inProcess: boolean; started: (firstSample: number) => void; refreshMicrophone?: () => Promise<void> }
   >()
 
   constructor(private readonly cfg: CpStackConfig) {
     super()
     this._mfi = cfg.mfi
-    // Same reverse path whether the host or the addon received the first sample.
-    onAudioReceiverStarted((id, firstSample) => this._audioStarted(id, firstSample))
     gstHost.onAudioStarted((id: number, firstSample: number) => this._audioStarted(id, firstSample))
   }
 
   private _audioStarted(id: number, firstSample: number): void {
+    if (this._closing) return
     const entry = this._audioById.get(id)
     if (!entry) return
     entry.started(firstSample)
@@ -243,11 +244,16 @@ export class CpStack extends EventEmitter {
   }
 
   stop(): void {
+    if (this._closing) return
     this._closing = true
-    // Tear down live sessions (closes the iAP2-over-CarPlay tunnel to the helper,
-    // so its session count drops and the carkit watcher can reconnect on replug).
+    // The caller may close the native window as soon as stop returns. Socket
+    // close events run later, so stop every decoder before destroying sockets.
+    for (const session of this._sessionSock.keys()) this._teardown(session)
+    this._active = null
+    this._liveSession = null
     for (const sock of [...this._conns]) sock.destroy()
     this._conns.clear()
+    this._sessionSock.clear()
   }
 
   /** Adopt an already-accepted control connection (CpManager owns the :7000 listener). */
@@ -340,12 +346,17 @@ export class CpStack extends EventEmitter {
   private _checkHeartbeat(session:CpSession):void {
     if(this._closing || session!==this._liveSession)return
     const now=process.hrtime.bigint(), counts:number[]=addon.mediaActivity()
+    const previousCheck=session.lastHeartbeatCheckNs
+    session.lastHeartbeatCheckNs=now
+    // AppKit live resize can hold the JS event loop while UDP packets wait in
+    // the socket. A delayed timer must allow those callbacks to run first.
+    if(previousCheck!==undefined && now-previousCheck>5_000_000_000n)session.heartbeatResumedNs=now
     if(counts.some((value,index)=>value!==session.mediaCounts?.[index]))session.lastMediaReadNs=now
     session.mediaCounts=counts
     const timing=session.timing?.lastActivityNs||0n,keepAlive=session.keepAlive?.lastActivityNs||0n
     if(!timing&&!keepAlive)return // A static screen without negotiated heartbeats is not a disconnect.
     if(!session.heartbeatEstablished){session.heartbeatEstablished=true;console.log('[connection] heartbeat established')}
-    const latest=[timing,keepAlive,session.lastCtrlReadNs,session.lastMediaReadNs||0n].reduce((a,b)=>a>b?a:b)
+    const latest=[timing,keepAlive,session.lastCtrlReadNs,session.lastMediaReadNs||0n,session.heartbeatResumedNs||0n].reduce((a,b)=>a>b?a:b)
     if(now-latest<15_000_000_000n)return
     console.log('[connection] heartbeat timeout idleMs='+Number((now-latest)/1_000_000n))
     this.emit('disconnect-reason','iPhone网络连接已断开')
@@ -409,6 +420,19 @@ export class CpStack extends EventEmitter {
         if (entry.inProcess) setAudioReceiverVolume(id, level, rampMs)
         else gstHost.setAudioVolume(id, level, rampMs)
       }
+    }
+  }
+
+  /** Apply device changes without replacing the CarPlay session or its RTP keys. */
+  setAudioDevices(inputChanged = true, outputChanged = true): void {
+    if (this._closing) return
+    if (inputChanged) this._audioDeviceRevision++
+    for (const [id, entry] of this._audioById) {
+      if (outputChanged && entry.inProcess) {
+        const ok = addon.setAudioReceiverDevice(id, this.cfg.audioDevice?.() || undefined)
+        console.log(`[cp_audio] output route ${ok ? 'reopened' : 'failed'} id=${id}`)
+      }
+      if (inputChanged) void entry.refreshMicrophone?.()
     }
   }
 
@@ -504,6 +528,7 @@ export class CpStack extends EventEmitter {
       this._liveSession = session
       if(!session.heartbeat) {
         session.mediaCounts=addon.mediaActivity()
+        session.lastHeartbeatCheckNs=process.hrtime.bigint()
         session.heartbeat=setInterval(()=>this._checkHeartbeat(session),1000)
         session.heartbeat.unref?.()
       }
@@ -1013,7 +1038,10 @@ export class CpStack extends EventEmitter {
     }
     // Without a host process the addon binds the ports and plays in-process; `inProcess` routes
     // volume/active/close to it.
-    const inProc = openAudioReceiver(key, audioOpts)
+    const inProc = openAudioReceiver(key, audioOpts, (id, firstSample) => {
+      if (session.ended || !session.audioMeta.includes(meta)) return
+      this._audioStarted(id, firstSample)
+    })
     const {
       streamId: hostStreamId,
       dataPort,
@@ -1047,37 +1075,50 @@ export class CpStack extends EventEmitter {
 
     // The host reports the first packet it received. That anchors the media clock for
     // /feedback and brackets the mic, which runs while audio flows.
+    const sessionCurrent = () => !this._closing && !session.ended && this._liveSession === session && session.audioMeta.includes(meta)
+    const refreshMicrophone = async () => {
+      if (!sessionCurrent() || !inputKey || !meta.origin) return
+      const revision = this._audioDeviceRevision
+      const current = () => sessionCurrent() && revision === this._audioDeviceRevision
+      const device = this.cfg.audioInputDevice?.() || undefined
+      if (meta.micStreamId != null) {
+        // Reuse the encrypted sender: recreating it with the same key would
+        // reset its nonce/sequence counters. The native capture alone restarts.
+        if (meta.inProcess) {
+          const ok = addon.setMicUplinkDevice(meta.micStreamId, device)
+          console.log(`[cp_mic] input route ${ok ? 'reopened' : 'failed'}`)
+          this.emit('mic-active', ok, ok ? micRate : 0, ok ? micChannels : 0)
+        }
+        return
+      }
+      const micOpts = {
+        codec: isOpus ? ('opus' as const) : ('pcm' as const),
+        payloadType: type, sampleRate: micRate, channels: micChannels,
+        bitrate, frameMs, port: phoneMicPort, phone: session.peerHost, device
+      }
+      if (meta.inProcess) {
+        const id = await openMicUplink(inputKey, micOpts, current)
+        if (!current()) { if (id != null) closeMicUplink(id); return }
+        if (id == null) {
+          console.warn('[cpStack] mic uplink failed to open')
+          return
+        }
+        meta.micStreamId = id
+      } else {
+        meta.micStreamId = gstHost.openMic(inputKey, micOpts)
+      }
+      this.emit('mic-active', true, micRate, micChannels)
+    }
     this._audioById.set(hostStreamId, {
       prof,
       inProcess: meta.inProcess,
+      refreshMicrophone,
       started: async (firstSample: number) => {
-        const current=()=>!this._closing&&!session.ended&&this._liveSession===session&&session.audioMeta.includes(meta)
-        if(!current())return
+        if (!sessionCurrent()) return
+        // A hardware route change must not move the phone's media clock.
+        if (meta.origin) return
         meta.origin = { firstSample, originNs: process.hrtime.bigint() }
-        if (!inputKey || meta.micStreamId != null) return
-        const micOpts = {
-          codec: isOpus ? ('opus' as const) : ('pcm' as const),
-          payloadType: type,
-          sampleRate: micRate,
-          channels: micChannels,
-          bitrate,
-          frameMs,
-          port: phoneMicPort,
-          phone: session.peerHost,
-          device: this.cfg.audioInputDevice?.() || undefined
-        }
-        if (meta.inProcess) {
-          const id = await openMicUplink(inputKey, micOpts, current)
-          if(!current()){if(id!=null)closeMicUplink(id);return}
-          if (id == null) {
-            console.warn('[cpStack] mic uplink failed to open')
-            return
-          }
-          meta.micStreamId = id
-        } else {
-          meta.micStreamId = gstHost.openMic(inputKey, micOpts)
-        }
-        this.emit('mic-active', true, micRate, micChannels)
+        await refreshMicrophone()
       }
     })
 

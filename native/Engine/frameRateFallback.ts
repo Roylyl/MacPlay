@@ -9,8 +9,8 @@ export class FrameRateFallback {
   this.armed=true;this.timer=setTimeout(()=>this.failed(),this.delayMs)
  }
  failed(){
-  if(!this.armed||this.finished)return
-  this.cancel();this.retry(this.fps===120?90:60)
+  if(!this.armed||this.finished)return false
+  this.cancel();this.retry(this.fps===120?90:60);return true
  }
  videoStarted(){this.cancel()}
  cancel(){this.finished=true;this.armed=false;if(this.timer)clearTimeout(this.timer);this.timer=undefined}

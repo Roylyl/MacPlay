@@ -18,24 +18,32 @@ struct DisplayChoice: Identifiable {
     let builtIn: Bool
     let refresh: Double
     let size: CGSize
-    var label: String { "\(name)（\(width)×\(height)）" }
-    var details: String { "\(builtIn ? "内建显示器" : "外接显示器") · \(width)×\(height)像素 · \(Int(refresh))Hz · \(Int(size.width))×\(Int(size.height))mm" }
+    var pixelsVerified: Bool
+    var label: String { pixelsVerified ? "\(name)（\(width)×\(height)）" : name }
+    var details: String {
+        var items = [L(builtIn ? "内建显示器" : "外接显示器")]
+        items.append(pixelsVerified ? "\(width)×\(height)" + L("物理像素") : L("物理像素尚未确认"))
+        if refresh > 0 { items.append("\(Int(refresh))Hz") }
+        if size.width > 0 && size.height > 0 { items.append("\(Int(size.width))×\(Int(size.height))mm") }
+        return items.joined(separator: " · ")
+    }
 }
 struct AudioChoice: Identifiable { let id: String; let name: String }
 
 
-struct PhoneChoice: Codable, Identifiable {
+struct PhoneChoice: Codable, Identifiable, Equatable {
     var id: String
     var name: String
     var bluetooth: String? = nil
     var usb: String? = nil
 }
 
-struct PlaySettings: Codable {
+struct PlaySettings: Codable, Equatable {
     var language: String? = nil
     var autoReconnect: Bool? = nil
     var autoStartUSB: Bool? = nil
     var backgroundEnabled: Bool? = nil
+    var closeBehavior: String? = nil
     var displayID: UInt32? = nil
     var inputDevice: String? = nil
     var outputDevice: String? = nil
@@ -48,6 +56,11 @@ struct PlaySettings: Codable {
     var screenPixelHeight: Int? = nil
     var screenWidthMm: Double? = nil
     var screenHeightMm: Double? = nil
+    var screenPixelsVerified: Bool? = nil
+    var screenLogicalWidth: Double? = nil
+    var screenLogicalHeight: Double? = nil
+    var presentationWidth: Double? = nil
+    var presentationHeight: Double? = nil
     var fps = 60
     var selectedPhone: String? = nil
     var lastPhone: String? = nil
@@ -59,16 +72,31 @@ struct PlaySettings: Codable {
     var password = ""
     var channel = 36
     var wifiInterface = "en0"
+    var networkInterfaceMode: String? = nil
     var wifiMAC = ""
     var accessPointMAC: String? = nil
+    var accessPointOverride: String? = nil
     var bluetoothMAC = ""
     var audioEnabled = true
     var volume = 1.0
 }
 
 @MainActor final class PlayModel: NSObject, ObservableObject, CLLocationManagerDelegate {
-    @Published var settings = PlaySettings()
+    @Published var settings = PlaySettings() {
+        didSet {
+            if networkInput(oldValue) != networkInput(settings) { networkInputRevision &+= 1 }
+        }
+    }
     @Published var displays: [DisplayChoice] = []
+    @Published var displayLoading = false
+    @Published var displayStatus = ""
+    private var displayRequest = 0
+    private var lastDisplayPixels: [UInt32: DisplayPixels] = [:]
+    @Published private var displayDeferredUSB = Set<String>()
+    private var audioMonitor: AudioHardwareMonitor?
+    @Published var mediaStatistics: [String:Any] = [:]
+    @Published var preparingConnection = false
+    private var startRequest: UInt64 = 0
     @Published var audioInputs: [AudioChoice] = []
     @Published var audioOutputs: [AudioChoice] = []
     private var nowPlaying: [String:Any] = [:]
@@ -91,13 +119,19 @@ struct PlaySettings: Codable {
     private var logWrite:DispatchWorkItem?
     private var mediaPublish:DispatchWorkItem?
     private var fallbackQueued=false
-    var receivingOrWaiting:Bool {running || reconnectCycle}
+    var receivingOrWaiting:Bool {running || preparingConnection || reconnectCycle || !displayDeferredUSB.isEmpty}
     @Published var running = false
     @Published var page:Page? = .connection
     @Published var logs = ""
     @Published var credentialsReady = false
     @Published var readingPassword = false
     @Published var networkStatus = "尚未读取网络"
+    @Published var networkInterfaces: [NetworkInterfaceChoice] = []
+    @Published var readingNetwork = false
+    private var networkInputRevision: UInt64 = 0
+    private var networkQueryID: UInt64 = 0
+    private var networkInventoryError: String?
+    private var wifiDetails: WiFiNetworkDetails?
     @Published var passwordStatus = ""
     @Published var phoneChoices: [PhoneChoice] = []
     @Published var usbDevices: [String] = []
@@ -105,6 +139,8 @@ struct PlaySettings: Codable {
     @Published var usbError = ""
     private let locationManager = CLLocationManager()
     private var networkRequestPending = false
+    private var networkPermissionGuard: NetworkReadGuard?
+    private var deferredNetworkRead = DeferredNetworkRead()
     private var usbTimer: Timer?
     private var connectedUSBIDs = Set<String>()
     var currentUSBIDs:Set<String> {connectedUSBIDs}
@@ -113,6 +149,7 @@ struct PlaySettings: Codable {
     private var input: Pipe?
     private var output: Pipe?
     private var pending = Data()
+    private var logRedactor=DiagnosticRedactor.Stream()
     let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MacPlay")
     var authDirectory: URL { directory.appendingPathComponent("authentication") }
     var configURL: URL { directory.appendingPathComponent("settings.json") }
@@ -122,12 +159,17 @@ struct PlaySettings: Codable {
         locationManager.delegate = self
         try? FileManager.default.createDirectory(at: authDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         if let data = try? Data(contentsOf: configURL), let decoded = try? JSONDecoder().decode(PlaySettings.self, from:data) { settings = decoded }
+        if settings.closeBehavior == nil {settings.closeBehavior = FileManager.default.fileExists(atPath:configURL.path) ? (settings.backgroundEnabled == true ? "background" : "quit") : "ask"}
+        if settings.networkInterfaceMode == nil { settings.networkInterfaceMode = settings.wifiInterface == "en0" ? "auto" : "manual" }
         MacPlayLocalization.language=settings.language ?? "system"
         if ![30,60,90,120].contains(settings.fps) { settings.fps=60 }
         if settings.resolution == "1920x720" { settings.resolution="custom" }
         if settings.resolution == "3840x2160" { settings.resolution="native" }
         configureRemoteCommands(); refreshHardware(); installBundledCredentials(); updateResolution(); inspectCredentials(); detectNetwork(); refreshUSB()
         NotificationCenter.default.addObserver(forName:NSApplication.didChangeScreenParametersNotification,object:nil,queue:.main){[weak self] _ in Task { @MainActor in self?.refreshHardware(); self?.updateResolution() }}
+        audioMonitor=AudioHardwareMonitor { [weak self] inputChanged,outputChanged in
+            Task { @MainActor in self?.audioHardwareChanged(inputChanged:inputChanged,outputChanged:outputChanged) }
+        }
         usbTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshUSB() }
         }
@@ -147,27 +189,61 @@ struct PlaySettings: Codable {
             }
         }
     }
-    func refreshHardware() {
-        var native: [UInt32:(Int,Int)] = [:]
-        let task=Process();task.executableURL=URL(fileURLWithPath:"/usr/sbin/system_profiler");task.arguments=["SPDisplaysDataType","-json"]
-        let pipe=Pipe();task.standardOutput=pipe;task.standardError=FileHandle.nullDevice
-        if (try? task.run()) != nil {
-            let data=pipe.fileHandleForReading.readDataToEndOfFile();task.waitUntilExit()
-            if let root=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],let gpus=root["SPDisplaysDataType"] as? [[String:Any]] {
-                for panel in gpus.flatMap({$0["spdisplays_ndrvs"] as? [[String:Any]] ?? []}) {
-                    if let text=panel["_spdisplays_displayID"] as? String,let id=UInt32(text),let pixels=panel["spdisplays_pixelresolution"] as? String {
-                        let parts=pixels.replacingOccurrences(of:"spdisplays_",with:"").replacingOccurrences(of:"Retina",with:"").components(separatedBy:"x")
-                        if parts.count==2,let w=Int(parts[0].trimmingCharacters(in:.whitespaces)),let h=Int(parts[1].trimmingCharacters(in:.whitespaces)){native[id]=(w,h)}
-                    }
-                }
-            }
-        }
+    private var screenSignature: String {
+        NSScreen.screens.map { "\($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] ?? 0):\($0.frame):\($0.backingScaleFactor)" }.joined(separator: "|")
+    }
+    var exactDisplayAvailable: Bool {
+        guard let panel=displays.first(where:{$0.id==settings.displayID}) else {return false}
+        return DisplayCapabilities.permitsExactPixels(verified:panel.pixelsVerified,widthMm:panel.size.width,heightMm:panel.size.height,loading:displayLoading)
+    }
+    private func captureDisplays(confirmed: [UInt32:DisplayPixels]) {
         displays=NSScreen.screens.compactMap { screen in
             guard let id=(screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value else {return nil}
-            let mode=CGDisplayCopyDisplayMode(id)
-            return DisplayChoice(id:id,name:screen.localizedName,width:native[id]?.0 ?? mode?.pixelWidth ?? Int(screen.frame.width*screen.backingScaleFactor),height:native[id]?.1 ?? mode?.pixelHeight ?? Int(screen.frame.height*screen.backingScaleFactor),builtIn:CGDisplayIsBuiltin(id) != 0,refresh:mode?.refreshRate ?? 0,size:CGDisplayScreenSize(id))
+            let mode=CGDisplayCopyDisplayMode(id), pixels=confirmed[id] ?? lastDisplayPixels[id]
+            return DisplayChoice(id:id,name:screen.localizedName,width:pixels?.width ?? mode?.pixelWidth ?? Int(screen.frame.width*screen.backingScaleFactor),height:pixels?.height ?? mode?.pixelHeight ?? Int(screen.frame.height*screen.backingScaleFactor),builtIn:CGDisplayIsBuiltin(id) != 0,refresh:mode?.refreshRate ?? 0,size:CGDisplayScreenSize(id),pixelsVerified:confirmed[id] != nil)
         }.sorted { $0.builtIn && !$1.builtIn }
         if !displays.contains(where:{$0.id==settings.displayID}) {settings.displayID=displays.first?.id}
+    }
+    func refreshDisplays() {
+        displayRequest += 1
+        let request=displayRequest, signature=screenSignature
+        displayLoading=true;displayStatus="正在读取显示器参数…"
+        captureDisplays(confirmed:[:]);updateResolution()
+        Task {
+            let result=await Task.detached(priority:.utility) {
+                BoundedSystemQuery.run(executable:"/usr/sbin/system_profiler",arguments:["SPDisplaysDataType","-json"])
+            }.value
+            guard request==displayRequest else {return}
+            guard signature==screenSignature else {refreshDisplays();return}
+            displayLoading=false
+            let confirmed=result.error == nil ? DisplayCapabilities.parse(result.data) : nil
+            if let confirmed {lastDisplayPixels.merge(confirmed){_,new in new}}
+            captureDisplays(confirmed:confirmed ?? [:])
+            if !exactDisplayAvailable {
+                settings.strictPixels=false
+                if settings.resolution=="native" {settings.resolution="custom"}
+                displayStatus=result.error=="TIMEOUT" ? "显示器查询超时，可使用普通窗口模式或重新读取。" : "无法确认显示器物理参数，可使用普通窗口模式或重新读取。"
+            } else {displayStatus=""}
+            appendDiagnostic("display-query result=\(result.error ?? (confirmed == nil ? "INVALID_OUTPUT" : "OK")) displays=\(displays.count)")
+            updateResolution()
+            let devices=displayDeferredUSB.intersection(connectedUSBIDs)
+            displayDeferredUSB.removeAll()
+            startForUSBIfNeeded(devices)
+        }
+    }
+    func selectDisplay(_ id: UInt32) {
+        settings.displayID=id
+        if !displayLoading && !exactDisplayAvailable {
+            settings.strictPixels=false
+            if settings.resolution=="native" {settings.resolution="custom"}
+            displayStatus="无法确认显示器物理参数，可使用普通窗口模式或重新读取。"
+        } else if exactDisplayAvailable {displayStatus=""}
+        updateResolution()
+    }
+    func refreshHardware() {
+        refreshDisplays();refreshAudioDevices()
+    }
+    func refreshAudioDevices() {
         var address=AudioObjectPropertyAddress(mSelector:kAudioHardwarePropertyDevices,mScope:kAudioObjectPropertyScopeGlobal,mElement:kAudioObjectPropertyElementMain)
         var bytes: UInt32=0
         guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),&address,0,nil,&bytes)==noErr else {return}
@@ -194,7 +270,39 @@ struct PlaySettings: Codable {
         if let uid=settings.inputDevice,!uid.isEmpty,!audioInputs.contains(where:{$0.id==uid}){settings.inputDevice=nil}
         if let uid=settings.outputDevice,!uid.isEmpty,!audioOutputs.contains(where:{$0.id==uid}){settings.outputDevice=nil}
     }
+    func audioHardwareChanged(inputChanged: Bool, outputChanged: Bool) {
+        let oldInput=settings.inputDevice ?? "",oldOutput=settings.outputDevice ?? ""
+        refreshAudioDevices()
+        let inputLost=oldInput != (settings.inputDevice ?? ""),outputLost=oldOutput != (settings.outputDevice ?? "")
+        applyAudioDevices(inputChanged:inputLost || (inputChanged && oldInput.isEmpty),outputChanged:outputLost || (outputChanged && oldOutput.isEmpty))
+    }
+    func applyAudioDevices(inputChanged: Bool = true, outputChanged: Bool = true) {
+        if inputChanged {appliedSettings?.inputDevice=settings.inputDevice;successfulSettings?.inputDevice=settings.inputDevice}
+        if outputChanged {appliedSettings?.outputDevice=settings.outputDevice;successfulSettings?.outputDevice=settings.outputDevice}
+        persistPreferences()
+        guard inputChanged || outputChanged else {return}
+        let message:[String:Any]=["command":"audio-devices","inputDevice":settings.inputDevice ?? "","outputDevice":settings.outputDevice ?? "","inputChanged":inputChanged,"outputChanged":outputChanged]
+        if let data=try? JSONSerialization.data(withJSONObject:message),let line=String(data:data,encoding:.utf8){command(line)}
+    }
+    var videoStatisticsText: String {
+        guard let video=mediaStatistics["video"] as? [String:Any],let width=video["width"] as? Int,let height=video["height"] as? Int,width>0,height>0 else {return "—"}
+        return "\(width)×\(height)"
+    }
+    func statisticFPS(_ key: String) -> String {
+        guard let video=mediaStatistics["video"] as? [String:Any],let value=video[key] as? NSNumber else {return "—"}
+        return String(format:"%.1ffps",value.doubleValue)
+    }
+    var attemptedFPS: Int {appliedSettings?.fps ?? settings.fps}
+    var audioFormatText: String {
+        guard let streams=mediaStatistics["audio"] as? [[String:Any]], !streams.isEmpty else {return "—"}
+        return Array(Set(streams.compactMap { item -> String? in
+            guard let codec=item["codec"] as? String,let rate=item["sampleRate"] as? NSNumber,let channels=item["channels"] as? NSNumber else {return nil}
+            return "\(codec.uppercased()) · \(rate.intValue)Hz · \(channels.intValue)ch"
+        })).sorted().joined(separator:" / ")
+    }
     func applyLiveAudio() {
+        appliedSettings?.volume=settings.volume;appliedSettings?.callVolume=settings.callVolume;appliedSettings?.audioEnabled=settings.audioEnabled
+        successfulSettings?.volume=settings.volume;successfulSettings?.callVolume=settings.callVolume;successfulSettings?.audioEnabled=settings.audioEnabled
         let message:[String:Any]=["command":"audio","volume":settings.volume,"callVolume":settings.callVolume ?? 1,"enabled":settings.audioEnabled]
         if let data=try? JSONSerialization.data(withJSONObject:message),let line=String(data:data,encoding:.utf8){command(line)}
         if let data=try? JSONEncoder().encode(settings){try? data.write(to:configURL,options:.atomic);try? FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:configURL.path)}
@@ -235,7 +343,7 @@ struct PlaySettings: Codable {
         startForUSBIfNeeded(connectedUSBIDs)
     }
     func startForUSBIfNeeded(_ devices:Set<String>) {
-        guard automaticStartReady,settings.autoStartUSB == true,!running,!reconnectCycle,!devices.isEmpty else {return}
+        guard automaticStartReady,settings.autoStartUSB == true,!running,!preparingConnection,!reconnectCycle,!devices.isEmpty else {return}
         let selected=settings.selectedPhone ?? settings.lastPhone
         let preferred=phoneChoices.first(where:{$0.id==selected})
         if settings.selectedPhone != nil,preferred?.usb == nil {return}
@@ -245,6 +353,12 @@ struct PlaySettings: Codable {
             guard devices.count==1,let serial=devices.first,let phone=phoneChoices.first(where:{$0.usb?.replacingOccurrences(of:"-",with:"").lowercased()==serial}) else {return}
             settings.selectedPhone=phone.id
         }
+        if displayLoading && (settings.strictPixels == true || settings.resolution=="native") {
+            displayDeferredUSB.formUnion(devices)
+            status="正在读取显示器参数…";detail="显示器检测完成后自动启动USB连接。"
+            return
+        }
+        displayDeferredUSB.removeAll()
         settings.wireless=false
         start()
     }
@@ -331,12 +445,16 @@ struct PlaySettings: Codable {
             let physicalHeight=displays.first(where:{$0.id==id})?.height ?? Int(screen.frame.height*screen.backingScaleFactor)
             settings.screenPixelWidth=physicalWidth
             settings.screenPixelHeight=physicalHeight
+            settings.screenPixelsVerified=exactDisplayAvailable
+            settings.screenLogicalWidth=screen.frame.width
+            settings.screenLogicalHeight=screen.frame.height
             if let display=screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
                 let size=CGDisplayScreenSize(CGDirectDisplayID(display.uint32Value))
                 settings.screenWidthMm=size.width>0 ? size.width : nil
                 settings.screenHeightMm=size.height>0 ? size.height : nil
             }
         if settings.resolution == "native" {
+            guard exactDisplayAvailable else {return}
             // Map macOS safe-area points to physical panel pixels, rather than
             // subtracting points from pixels or using the scaled desktop size.
             let insets=screen.safeAreaInsets
@@ -347,28 +465,106 @@ struct PlaySettings: Codable {
         } else if settings.resolution != "custom" {
             let parts=settings.resolution.split(separator:"x");if parts.count==2,let w=Int(parts[0]),let h=Int(parts[1]){settings.width=w;settings.height=h}
         }
+        let fitted=DisplayCapabilities.fittedSize(width:settings.width,height:settings.height,visibleWidth:screen.visibleFrame.width,visibleHeight:screen.visibleFrame.height)
+        settings.presentationWidth=fitted.0
+        settings.presentationHeight=fitted.1
     }
-    func detectNetwork(requestPermission: Bool = false) {
-        guard let interface=CWWiFiClient.shared().interface(), interface.powerOn() else {
-            networkStatus = "Wi-Fi未开启或没有可用接口"; return
+    private func networkInput(_ value: PlaySettings) -> NetworkInputSnapshot {
+        NetworkInputSnapshot(mode:value.networkInterfaceMode ?? "auto",interface:value.wifiInterface,
+            ssid:value.ssid,password:value.password,channel:value.channel,bssid:value.accessPointOverride ?? value.accessPointMAC)
+    }
+    private var networkReadGuard: NetworkReadGuard { NetworkReadGuard(revision:networkInputRevision,input:networkInput(settings)) }
+    private func acceptsNetworkRead(_ guardValue: NetworkReadGuard) -> Bool {
+        guardValue.accepts(revision:networkInputRevision,input:networkInput(settings))
+    }
+    var selectedNetwork: NetworkInterfaceChoice? {
+        NetworkSelection.resolve(manual:settings.networkInterfaceMode == "manual",name:settings.wifiInterface,interfaces:networkInterfaces)
+    }
+    func selectNetworkInterface(_ name: String?) {
+        settings.networkInterfaceMode = name == nil ? "auto" : "manual"
+        if let name { settings.wifiInterface=name }
+        settings.accessPointMAC=nil;wifiDetails=nil
+        networkRequestPending=false;networkPermissionGuard=nil
+        deferredNetworkRead.cancel()
+        networkQueryID &+= 1;readingNetwork=false
+        persistPreferences();detectNetwork()
+    }
+    func networkLabel(_ choice: NetworkInterfaceChoice) -> String {
+        "\(choice.name)（\(choice.id)） · \(L(choice.wireless ? "Wi-Fi" : "以太网")) · \(L(choice.ready ? "已连接" : "未连接"))"
+    }
+    func detectNetwork(requestPermission: Bool = false, readCredentials: Bool = false) {
+        guard !readingNetwork else {return}
+        readingNetwork=true;networkQueryID &+= 1
+        let queryID=networkQueryID, guardValue=networkReadGuard, began=Date()
+        BoundedNetworkQuery.run(work:{NetworkInterfaceReader.read()}) { [weak self] result in
+            Task { @MainActor in
+                guard let self,self.networkQueryID == queryID else {return}
+                defer {self.consumeDeferredNetworkRead()}
+                switch result {
+                case .failure:
+                    self.readingNetwork=false;self.networkInventoryError="TIMEOUT"
+                    self.networkStatus="网络接口查询超时，已保留当前设置，请重试。"
+                    self.appendDiagnostic("network-query stage=interfaces code=TIMEOUT elapsedMs=\(Int(Date().timeIntervalSince(began)*1000))")
+                case .success(let inventory):
+                    self.networkInventoryError=inventory.error
+                    self.appendDiagnostic("network-query stage=interfaces code=\(inventory.error ?? "OK") elapsedMs=\(Int(Date().timeIntervalSince(began)*1000)) count=\(inventory.interfaces.count)")
+                    guard inventory.error == nil else {
+                        self.readingNetwork=false;self.networkStatus="无法读取网络接口状态，已保留当前设置，请重试。";return
+                    }
+                    self.networkInterfaces=inventory.interfaces
+                    let importAllowed=(requestPermission || readCredentials) && self.acceptsNetworkRead(guardValue)
+                    guard let selected=self.selectedNetwork else {
+                        self.readingNetwork=false
+                        self.networkStatus=self.settings.networkInterfaceMode == "manual" ? "所选网络接口暂不可用，请重新连接设备或选择其他接口。" : "没有可用的Wi-Fi或以太网接口，请先连接网络。"
+                        return
+                    }
+                    if self.settings.networkInterfaceMode != "manual" {self.settings.wifiInterface=selected.id}
+                    self.settings.wifiMAC=selected.hardwareAddress ?? ""
+                    if !selected.wireless {
+                        self.readingNetwork=false;self.wifiDetails=nil;self.settings.accessPointMAC=nil
+                        self.networkStatus=selected.ready ? "当前使用以太网。请填写iPhone所连Wi-Fi的SSID、密码和实际信道，并确保两端位于同一局域网。" : "所选以太网未连接或尚未获得网络地址。"
+                        return
+                    }
+                    self.queryWiFiDetails(selected.id,queryID:queryID,importAllowed:importAllowed,requestPermission:requestPermission)
+                }
+            }
         }
-        settings.wifiInterface=interface.interfaceName ?? "en0"
-        settings.wifiMAC=interface.hardwareAddress() ?? ""
-        let addressTask=Process();addressTask.executableURL=URL(fileURLWithPath:"/sbin/ifconfig");addressTask.arguments=[settings.wifiInterface]
-        let addressPipe=Pipe();addressTask.standardOutput=addressPipe;addressTask.standardError=FileHandle.nullDevice
-        if (try? addressTask.run()) != nil {
-            let data=addressPipe.fileHandleForReading.readDataToEndOfFile();addressTask.waitUntilExit()
-            if let text=String(data:data,encoding:.utf8),let line=text.split(separator:"\n").first(where:{$0.trimmingCharacters(in:.whitespaces).hasPrefix("ether ")}),let mac=line.split(whereSeparator:{$0.isWhitespace}).last {settings.wifiMAC=String(mac)}
+    }
+    private func queryWiFiDetails(_ interface: String, queryID: UInt64, importAllowed: Bool, requestPermission: Bool) {
+        let guardValue=networkReadGuard,began=Date()
+        BoundedNetworkQuery.run(work:{NetworkInterfaceReader.wifiDetails(interface:interface)}) { [weak self] result in
+            Task { @MainActor in
+                guard let self,self.networkQueryID == queryID else {return}
+                defer {self.consumeDeferredNetworkRead()}
+                self.readingNetwork=false
+                guard self.settings.wifiInterface == interface else {return}
+                switch result {
+                case .failure:
+                    self.wifiDetails=nil;self.networkStatus="Wi-Fi详情查询超时，网络接口仍可用，请重试或手动填写。"
+                    self.appendDiagnostic("network-query stage=wifi code=TIMEOUT elapsedMs=\(Int(Date().timeIntervalSince(began)*1000))")
+                case .success(let details):
+                    self.wifiDetails=details
+                    self.appendDiagnostic("network-query stage=wifi code=\(details == nil ? "UNAVAILABLE" : "OK") elapsedMs=\(Int(Date().timeIntervalSince(began)*1000))")
+                    guard let details else {self.networkStatus="系统未返回所选Wi-Fi接口信息，请重试。";return}
+                    guard details.powered else {self.networkStatus="所选Wi-Fi未开启，请先开启Wi-Fi。";return}
+                    if let ssid=details.ssid,!ssid.isEmpty {
+                        guard importAllowed else {
+                            self.networkStatus=ssid == self.settings.ssid ? "当前Wi-Fi与连接配置一致。" : "当前Wi-Fi与连接配置不同，请读取当前网络或核对设置。"
+                            return
+                        }
+                        guard self.acceptsNetworkRead(guardValue) else {self.networkStatus="网络设置已修改，未覆盖新填写的内容。";return}
+                        if self.settings.ssid != ssid {self.settings.password="";self.settings.accessPointOverride=nil;self.passwordStatus="网络已切换，请读取或填写当前网络密码。"}
+                        self.settings.ssid=ssid;self.settings.accessPointMAC=details.bssid
+                        if let channel=details.channel {self.settings.channel=channel}
+                        self.networkStatus="已读取当前Wi-Fi名称和信道";self.networkRequestPending=false;self.networkPermissionGuard=nil
+                    } else {
+                        self.explainWiFiAccess(requestPermission:requestPermission && importAllowed && self.acceptsNetworkRead(guardValue))
+                    }
+                }
+            }
         }
-        if let channel=interface.wlanChannel(){settings.channel=Int(channel.channelNumber)}
-        if let ssid=interface.ssid(), !ssid.isEmpty {
-            if settings.ssid != ssid {settings.password="";passwordStatus="网络已切换，请读取或填写当前网络密码。"}
-            settings.ssid=ssid
-            settings.accessPointMAC=interface.bssid()
-            networkStatus="已读取当前Wi-Fi名称和信道"
-            networkRequestPending=false
-            return
-        }
+    }
+    private func explainWiFiAccess(requestPermission: Bool) {
         guard CLLocationManager.locationServicesEnabled() else {
             networkStatus="系统定位服务已关闭。读取Wi-Fi名称需要在系统设置中开启定位服务。";return
         }
@@ -376,29 +572,30 @@ struct PlaySettings: Codable {
         case .notDetermined:
             networkStatus="读取Wi-Fi名称需要定位权限；点击“读取当前网络”后按系统提示允许。"
             if requestPermission {
-                networkRequestPending=true
-                locationManager.requestWhenInUseAuthorization()
-                // macOS requests authorization when a location service starts.
-                // Only use this one-shot request to trigger authorization; coordinates are discarded.
-                locationManager.requestLocation()
+                networkRequestPending=true;networkPermissionGuard=networkReadGuard
+                locationManager.requestWhenInUseAuthorization();locationManager.requestLocation()
             }
-        case .denied, .restricted:
+        case .denied,.restricted:
             networkStatus="定位权限未允许。请在“隐私与安全性→定位服务”中允许MacPlay后重试。"
         default:
-            networkStatus="已获定位权限，但系统未返回Wi-Fi名称。请确认Mac已连接Wi-Fi后重试。"
+            networkStatus="系统未返回Wi-Fi名称，请确认连接与定位权限，或手动填写。"
         }
     }
     var currentNetworkIsEnterprise: Bool {
-        guard let interface=CWWiFiClient.shared().interface(withName:settings.wifiInterface),interface.ssid()==settings.ssid else {return false}
-        return [7,8,9,10,12].contains(Int(interface.security().rawValue))
+        guard let wifiDetails,wifiDetails.interface == settings.wifiInterface,wifiDetails.ssid == settings.ssid else {return false}
+        return wifiDetails.enterprise
     }
     func readSavedNetworkPassword() {
         guard !readingPassword else { return }
+        guard !readingNetwork else {passwordStatus="正在读取网络状态，请稍后重试。";return}
         if currentNetworkIsEnterprise {
             passwordStatus="当前网络使用802.1X企业认证（用户名/密码或证书）。MacPlay的无线握手不支持发送这类凭据，请改用个人Wi-Fi、热点或USB连接。"
             return
         }
-        let ssid=settings.ssid
+        if selectedNetwork?.wireless == true, let wifiDetails, let actual=wifiDetails.ssid, actual != settings.ssid {
+            passwordStatus="当前Wi-Fi与连接配置不同，请先读取当前网络。";return
+        }
+        let ssid=settings.ssid,guardValue=networkReadGuard
         guard !ssid.isEmpty else {passwordStatus="请先读取当前网络名称。";return}
         readingPassword=true
         passwordStatus="正在读取钥匙串；如有系统提示，请授权MacPlay访问该网络密码。"
@@ -417,7 +614,7 @@ struct PlaySettings: Codable {
                 return (status,password)
             }.value
             readingPassword=false
-            guard settings.ssid==ssid else {passwordStatus="网络已切换，请重新读取密码。";return}
+            guard acceptsNetworkRead(guardValue) else {passwordStatus="网络设置已修改，未覆盖新填写的内容。";return}
             if result.0==errSecSuccess,let password=result.1,!password.isEmpty {
                 settings.password=password
                 passwordStatus="已读取保存的密码，点击“应用并重新连接”使用网络凭据。"
@@ -436,14 +633,30 @@ struct PlaySettings: Codable {
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         Task { @MainActor [weak self] in
             guard let self else {return}
-            if self.networkRequestPending { self.detectNetwork() }
+            if self.networkRequestPending { self.resumeNetworkPermission() }
         }
     }
+    private func resumeNetworkPermission() {
+        guard networkRequestPending else {return}
+        let unchanged=networkPermissionGuard.map(acceptsNetworkRead) ?? false
+        if !unchanged {
+            networkRequestPending=false;networkPermissionGuard=nil
+            deferredNetworkRead.cancel()
+            networkStatus="网络设置已修改，未覆盖新填写的内容。"
+            return
+        }
+        if let networkPermissionGuard {deferredNetworkRead.enqueue(networkPermissionGuard)}
+        consumeDeferredNetworkRead()
+    }
+    private func consumeDeferredNetworkRead() {
+        guard deferredNetworkRead.takeIfIdle(reading:readingNetwork,revision:networkInputRevision,input:networkInput(settings)) != nil else {return}
+        detectNetwork(readCredentials:true)
+    }
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        Task { @MainActor [weak self] in self?.detectNetwork() }
+        Task { @MainActor [weak self] in self?.resumeNetworkPermission() }
     }
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        Task { @MainActor [weak self] in self?.detectNetwork() }
+        Task { @MainActor [weak self] in self?.resumeNetworkPermission() }
     }
     func refreshUSB() {
         var iterator: io_iterator_t=0
@@ -477,6 +690,9 @@ struct PlaySettings: Codable {
         phoneChoices=choices
         let added=serials.subtracting(connectedUSBIDs)
         connectedUSBIDs=serials
+        let hadDeferredUSB = !displayDeferredUSB.isEmpty
+        displayDeferredUSB.formIntersection(serials)
+        if hadDeferredUSB && displayDeferredUSB.isEmpty {status="尚未启动接收";detail="连接iPhone后启动接收端。"}
         if changed {usbError="";usbStage=running ? "等待USB握手，请保持iPhone解锁" : "接收服务未启动"}
         startForUSBIfNeeded(added)
     }
@@ -490,6 +706,9 @@ struct PlaySettings: Codable {
     }
     func save() throws {
         updateResolution()
+        if (settings.strictPixels == true || settings.resolution == "native") && !exactDisplayAvailable {
+            throw NSError(domain:"MacPlay",code:3,userInfo:[NSLocalizedDescriptionKey:"无法确认显示器物理参数，请刷新显示器或使用普通窗口模式。"])
+        }
         settings.width=max(320,min(7680,settings.width/2*2));settings.height=max(200,min(4320,settings.height/2*2))
         if settings.strictPixels == true,settings.resolution != "native",let screen=selectedScreen,
            let physicalWidth=settings.screenPixelWidth,let physicalHeight=settings.screenPixelHeight {
@@ -498,9 +717,6 @@ struct PlaySettings: Codable {
             if frame.width>screen.visibleFrame.width || frame.height>screen.visibleFrame.height {
                 throw NSError(domain:"MacPlay",code:2,userInfo:[NSLocalizedDescriptionKey:"所选分辨率超过当前屏幕的可见区域，无法按物理像素比例显示。请选择较低分辨率，或使用原生像素全屏模式。"])
             }
-        }
-        guard let w=settings.screenWidthMm,let h=settings.screenHeightMm,w>0,h>0 else {
-            throw NSError(domain:"MacPlay",code:3,userInfo:[NSLocalizedDescriptionKey:"系统未返回显示器真实尺寸，无法上报固定窗口的物理大小。"])
         }
         let selected=settings.selectedPhone ?? settings.lastPhone
         let phone=phoneChoices.first(where:{$0.id==selected})
@@ -525,6 +741,7 @@ struct PlaySettings: Codable {
         if !enabled {let waiting=reconnectCycle && !running;cancelReconnect(clearSession:!running);if waiting {status="接收已停止";detail=""}}
     }
     private func cancelReconnect(clearSession:Bool=true) {
+        startRequest &+= 1;preparingConnection=false
         reconnectTimer?.invalidate();reconnectTimer=nil;reconnectBackoff.reset();reconnectCycle=false;if clearSession {successfulSettings=nil}
     }
     private func scheduleReconnect() {
@@ -568,27 +785,92 @@ struct PlaySettings: Codable {
         }
         logWrite=work;DispatchQueue.main.asyncAfter(deadline:.now()+0.3,execute:work)
     }
+    private func reportStartProblem(_ title: String, _ message: String) {
+        if running {networkStatus=message;detail=message}
+        else {status=title;detail=message}
+    }
     func start(isFallback:Bool=false,isAutomatic:Bool=false) {
-        if !isFallback && !isAutomatic {cancelReconnect()}
+        if !settings.wireless {launchStart(isFallback:isFallback,isAutomatic:isAutomatic);return}
+        if !isFallback && !isAutomatic {cancelReconnect(clearSession:false)}
+        startRequest &+= 1
+        let request=startRequest,snapshot=settings
+        preparingConnection=true;networkStatus="正在检查连接网络…"
+        BoundedNetworkQuery.run(work:{ () -> (NetworkInventory,NetworkInterfaceChoice?,WiFiNetworkDetails?) in
+            let inventory=NetworkInterfaceReader.read()
+            let selected=NetworkSelection.resolve(manual:snapshot.networkInterfaceMode == "manual",name:snapshot.wifiInterface,interfaces:inventory.interfaces)
+            let details=selected.flatMap{$0.wireless ? NetworkInterfaceReader.wifiDetails(interface:$0.id) : nil}
+            return (inventory,selected,details)
+        }) { [weak self] result in
+            Task { @MainActor in
+                guard let self,self.startRequest == request else {return}
+                defer {if !self.running && self.reconnectCycle {self.scheduleReconnect()}}
+                self.preparingConnection=false
+                guard !isAutomatic || self.settings.autoReconnect == true else {return}
+                guard isFallback || isAutomatic || self.settings == snapshot else {self.networkStatus="设置已修改，请重新启动接收。";return}
+                switch result {
+                case .failure:
+                    self.reportStartProblem("无法确认网络接口状态","连接前网络检查超时，请重试。");if isAutomatic {self.scheduleReconnect()};return
+                case .success(let (inventory,selected,details)):
+                    self.networkInterfaces=inventory.interfaces;self.networkInventoryError=inventory.error;self.wifiDetails=details
+                    guard inventory.error == nil,let selected,selected.ready else {
+                        self.reportStartProblem("所选网络尚未连接","请检查Wi-Fi或网线连接，等待接口获得网络地址。");return
+                    }
+                    var prepared=snapshot
+                    if isFallback || isAutomatic {
+                        prepared.inputDevice=self.settings.inputDevice;prepared.outputDevice=self.settings.outputDevice
+                        prepared.volume=self.settings.volume;prepared.callVolume=self.settings.callVolume;prepared.audioEnabled=self.settings.audioEnabled
+                    }
+                    if selected.wireless,let details {
+                        guard !details.enterprise else {self.reportStartProblem("当前Wi-Fi采用企业认证","无线CarPlay握手不支持802.1X用户名/密码或证书，请改用个人Wi-Fi、热点或USB连接。");return}
+                        guard details.powered else {self.reportStartProblem("所选网络尚未连接","所选Wi-Fi未开启，请先开启Wi-Fi。");return}
+                        if let ssid=details.ssid,!ssid.isEmpty {
+                            guard ssid == snapshot.ssid else {self.reportStartProblem("当前Wi-Fi与连接配置不一致","请读取当前网络并填写对应密码。");return}
+                            if let channel=details.channel {prepared.channel=channel}
+                        }
+                    }
+                    self.networkStatus="连接网络检查完成"
+                    let draft=self.settings;self.settings=prepared
+                    self.launchStart(isFallback:isFallback,isAutomatic:isAutomatic)
+                    if isFallback || isAutomatic {self.settings=draft;self.persistPreferences()}
+                }
+            }
+        }
+    }
+    private func launchStart(isFallback:Bool=false,isAutomatic:Bool=false) {
+        if !isFallback && !isAutomatic {cancelReconnect(clearSession:false)}
         defer {if !running && reconnectCycle {scheduleReconnect()}}
 
         if !isFallback {frameRateFallbackNote=""}
         fallbackQueued=false
-        stop(restoreMain:false,preserveReconnect:isFallback || isAutomatic);inspectCredentials()
+        inspectCredentials()
         settings.bluetoothMAC=IOBluetoothHostController.default()?.addressAsString()?.replacingOccurrences(of:"-",with:":") ?? ""
-        guard credentialsReady else {status="缺少认证文件";detail="请在关于页面导入有使用权限的配套认证文件。";return}
+        guard credentialsReady else {reportStartProblem("缺少认证文件", "请在关于页面导入有使用权限的配套认证文件。");return}
         if settings.wireless && currentNetworkIsEnterprise {
-            status="当前Wi-Fi采用企业认证";detail="无线CarPlay握手不支持802.1X用户名/密码或证书，请改用个人Wi-Fi、热点或USB连接。";return
+            reportStartProblem("当前Wi-Fi采用企业认证", "无线CarPlay握手不支持802.1X用户名/密码或证书，请改用个人Wi-Fi、热点或USB连接。");return
         }
-        if settings.wireless && settings.ssid.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
-            status="无线连接缺少网络信息";detail="请先读取当前Wi-Fi名称。";return
+        if settings.wireless && settings.ssid.isEmpty {
+            reportStartProblem("无线连接缺少网络信息", "请先读取当前Wi-Fi名称。");return
         }
-        if settings.wireless,let network=CWWiFiClient.shared().interface(withName:settings.wifiInterface),let actual=network.ssid(),!actual.isEmpty,actual != settings.ssid {
-            status="当前Wi-Fi与连接配置不一致";detail="请读取当前网络并填写对应密码。";return
+        if settings.wireless {
+            guard !readingNetwork else {reportStartProblem("正在读取网络状态", "请等待读取完成后启动接收。");return}
+            guard networkInventoryError == nil else {reportStartProblem("无法确认网络接口状态", "请重新读取网络，确认接口状态后再启动接收。");return}
+            guard let selected=selectedNetwork else {reportStartProblem("所选网络接口暂不可用", "请连接网络或选择其他接口。");return}
+            guard selected.ready else {reportStartProblem("所选网络尚未连接", "请检查Wi-Fi或网线连接，等待接口获得网络地址。");return}
+            settings.wifiInterface=selected.id;settings.wifiMAC=selected.hardwareAddress ?? ""
+            if selected.wireless, let wifiDetails, wifiDetails.interface == selected.id,
+               let actual=wifiDetails.ssid,!actual.isEmpty {
+                guard actual == settings.ssid else {reportStartProblem("当前Wi-Fi与连接配置不一致", "请读取当前网络并填写对应密码。");return}
+                settings.accessPointMAC=wifiDetails.bssid
+            } else {settings.accessPointMAC=nil}
+            if let manual=settings.accessPointOverride?.trimmingCharacters(in:.whitespacesAndNewlines),!manual.isEmpty {
+                guard manual.range(of:#"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$"#,options:.regularExpression) != nil else {reportStartProblem("接入点BSSID格式无效","请填写六组十六进制地址，或留空自动读取。");return}
+                settings.accessPointMAC=manual.uppercased()
+            }
         }
         do {
             try save()
-            appliedSettings=settings
+            stop(restoreMain:false,preserveReconnect:isFallback || isAutomatic)
+            appliedSettings=settings;mediaStatistics=[:];logRedactor=DiagnosticRedactor.Stream()
             let sessionURL=directory.appendingPathComponent("session-settings.json")
             try JSONEncoder().encode(settings).write(to:sessionURL,options:.atomic)
             try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:sessionURL.path)
@@ -616,7 +898,7 @@ struct PlaySettings: Codable {
             }()
             environment["DYLD_LIBRARY_PATH"]=gstLibPath
             task.environment=environment
-            let stdin=Pipe(),stdout=Pipe();task.standardInput=stdin;task.standardOutput=stdout;task.standardError=stdout
+            let stdin=try ReceiverCommandPipe.make(),stdout=Pipe();task.standardInput=stdin;task.standardOutput=stdout;task.standardError=stdout
             output=stdout;input=stdin;process=task
             stdout.fileHandleForReading.readabilityHandler={ [weak self] handle in
                 let data=handle.availableData
@@ -630,14 +912,16 @@ struct PlaySettings: Codable {
                 guard self?.process === task else {return};self?.passiveDisconnect("接收进程已退出")
             }}
             try task.run();running=true;usbStage="等待USB握手，请保持iPhone解锁";usbError="";status="正在启动接收服务";detail=settings.wireless ? "准备蓝牙握手与共用Wi-Fi连接。" : "准备USB连接与配件认证。"
-        } catch {status="启动失败";detail=error.localizedDescription}
+        } catch {reportStartProblem("启动失败",error.localizedDescription)}
     }
     func stop(restoreMain:Bool=true,preserveReconnect:Bool=false) {
+        startRequest &+= 1;preparingConnection=false
+        displayDeferredUSB.removeAll()
         if !preserveReconnect {cancelReconnect()}
         if let task=process,task.isRunning {
             // Give the receiver time to close its window and USB/Bluetooth helpers
             // before starting another receiver on the same ports.
-            try? input?.fileHandleForWriting.write(contentsOf:Data("stop\n".utf8))
+            command("stop")
             let deadline=Date().addingTimeInterval(2)
             while task.isRunning && Date()<deadline {Thread.sleep(forTimeInterval:0.01)}
             if task.isRunning {kill(task.processIdentifier,SIGKILL)}
@@ -646,13 +930,15 @@ struct PlaySettings: Codable {
         output?.fileHandleForReading.readabilityHandler=nil;process=nil;input=nil;output=nil;running=false;pending.removeAll()
         status="接收已停止";detail="可以调整设置后重新启动。"
         usbStage="接收服务未启动";usbError=""
-        clearNowPlaying();if restoreMain {page = .connection;showMainWindow()}
+        mediaStatistics=[:];clearNowPlaying();if restoreMain {page = .connection;showMainWindow()}
     }
     func consume(_ data:Data) {
         pending.append(data)
         while let newline=pending.firstIndex(of:0x0a) {
             let line=String(decoding:pending[..<newline],as:UTF8.self);pending.removeSubrange(...newline)
             if let eventData=line.data(using:.utf8),let event=(try? JSONSerialization.jsonObject(with:eventData)) as? [String:Any] {
+                if event["type"] as? String == "videoStatistics" {mediaStatistics["video"]=event;continue}
+                if event["type"] as? String == "audioStatistics" {mediaStatistics["audio"]=event["streams"] ?? [];continue}
                 if let kind=event["type"] as? String,kind=="seekResult" {publishNowPlaying(event);continue}
                 if let kind=event["type"] as? String,kind=="nowplaying" || kind=="albumart" {continue}
                 if event["showCarPlay"] as? Bool == true {
@@ -709,11 +995,21 @@ struct PlaySettings: Codable {
                 }
                 readUSBEvent(value)
             }
-            logs += MacPlayUpdates.redactedLog(line)+"\n"
+            if let safeLine=logRedactor.consume(line) {logs += safeLine+"\n"}
         }
         queueLogWrite()
     }
-    func command(_ command:String){try? input?.fileHandleForWriting.write(contentsOf:Data((command+"\n").utf8))}
+    func command(_ command:String) {
+        guard let task=process,task.isRunning,let pipe=input else {return}
+        do {try ReceiverCommandPipe.write(command,to:pipe)}
+        catch {
+            input=nil
+            try? pipe.fileHandleForWriting.close()
+            let failure=error as NSError
+            let cause=failure.userInfo[NSUnderlyingErrorKey] as? NSError ?? failure
+            appendDiagnostic("receiver-command failed domain=\(cause.domain) code=\(cause.code)")
+        }
+    }
     func importCredentials() {
         let panel=NSOpenPanel();panel.canChooseFiles=true;panel.canChooseDirectories=false;panel.allowsMultipleSelection=true;panel.message=L("选择identity.pk8和certificate.p7b")
         guard panel.runModal() == .OK else {return}
@@ -765,6 +1061,11 @@ struct SettingsView: View {
                                 Text(L("English")).tag("en")
                             }
                             Toggle(L("USB接入时自动启动CarPlay"),isOn:Binding(get:{model.settings.autoStartUSB ?? false},set:{model.settings.autoStartUSB=$0;model.persistPreferences();if $0 {model.startForUSBIfNeeded(model.currentUSBIDs)}}))
+                            Picker(L("关闭主窗口时"),selection:Binding(get:{model.settings.closeBehavior ?? "ask"},set:{model.settings.closeBehavior=$0;if $0 == "background" {model.settings.backgroundEnabled=true};MacPlayApplicationDelegate.shared?.preferencesChanged()})) {
+                                Text(L("每次询问")).tag("ask")
+                                Text(L("保持后台运行")).tag("background")
+                                Text(L("退出MacPlay")).tag("quit")
+                            }
                             Toggle(L("允许后台运行"),isOn:Binding(get:{model.settings.backgroundEnabled ?? false},set:{model.settings.backgroundEnabled=$0;MacPlayApplicationDelegate.shared?.preferencesChanged()}))
                             Text(L("关闭主窗口后继续接收，可从菜单栏图标打开窗口或退出。自动启动需要MacPlay保持运行，并在iPhone上解锁和完成信任。")).font(.callout).foregroundStyle(.secondary)
                         }
@@ -777,32 +1078,49 @@ struct SettingsView: View {
                         if model.settings.wireless {
                             Section(L("共用Wi-Fi")) {
                                 Toggle(L("无线连接被动断开时自动重连"),isOn:Binding(get:{model.settings.autoReconnect ?? false},set:{model.setAutoReconnect($0)}))
-                                TextField(L("网络名称（SSID）"),text:Binding(get:{model.settings.ssid},set:{if model.settings.ssid != $0 {model.settings.password=""};model.settings.ssid=$0}))
+                                Picker(L("网络接口模式"),selection:Binding(get:{model.settings.networkInterfaceMode ?? "auto"},set:{model.selectNetworkInterface($0 == "auto" ? nil : model.settings.wifiInterface)})) {
+                                    Text(L("自动选择（推荐）")).tag("auto")
+                                    Text(L("手动选择网卡（高级）")).tag("manual")
+                                }
+                                if model.settings.networkInterfaceMode == "manual" {
+                                    Picker(L("网络接口"),selection:Binding(get:{model.settings.wifiInterface},set:{model.selectNetworkInterface($0)})) {
+                                        ForEach(model.networkInterfaces) {network in Text(model.networkLabel(network)).tag(network.id)}
+                                        if !model.networkInterfaces.contains(where:{$0.id == model.settings.wifiInterface}) {
+                                            Text("\(model.settings.wifiInterface) · \(L("暂不可用"))").tag(model.settings.wifiInterface)
+                                        }
+                                    }
+                                }
+                                if let selected=model.selectedNetwork {LabeledContent(L("当前接口"),value:model.networkLabel(selected))}
+                                TextField(L("网络名称（SSID）"),text:Binding(get:{model.settings.ssid},set:{if model.settings.ssid != $0 {model.settings.password="";model.settings.accessPointMAC=nil;model.settings.accessPointOverride=nil};model.settings.ssid=$0}))
                                 SecureField(L("网络密码"),text:$model.settings.password)
-                                TextField(L("网络接口"),text:$model.settings.wifiInterface)
                                 Stepper(L("信道：\(model.settings.channel)"),value:$model.settings.channel,in:1...196)
+                                DisclosureGroup(L("高级网络设置")) {
+                                    TextField(L("接入点BSSID（可选）"),text:Binding(get:{model.settings.accessPointOverride ?? ""},set:{model.settings.accessPointOverride=$0}))
+                                }
                                 HStack {
-                                    Button(L("读取当前网络")){model.detectNetwork(requestPermission:true)}
-                                    Button(L(model.readingPassword ? "正在读取密码…" : "读取已保存密码")){model.readSavedNetworkPassword()}.disabled(model.readingPassword || model.settings.ssid.isEmpty)
+                                    Button(L(model.readingNetwork ? "正在读取网络…" : "读取当前网络")){model.detectNetwork(requestPermission:true)}.disabled(model.readingNetwork)
+                                    Button(L(model.readingPassword ? "正在读取密码…" : "读取已保存密码")){model.readSavedNetworkPassword()}.disabled(model.readingPassword || model.readingNetwork || model.settings.ssid.isEmpty)
                                     Button(L("打开定位设置")){NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices")!)}
                                     Button(L("打开蓝牙设置")){NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.BluetoothSettings")!)}
                                 }
                                 Text(L(model.networkStatus)).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
                                 if !model.passwordStatus.isEmpty {Text(L(model.passwordStatus)).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)}
-                                Text(L("Mac与iPhone需加入同一Wi-Fi，并在两端确认蓝牙配对码。不会创建名为MacPlay的Wi-Fi。填写SSID与共享密码，或授权读取已保存的密码。802.1X企业Wi-Fi的用户名、个人密码或证书不能作为共享密码发送。")).font(.callout).foregroundStyle(.secondary)
+                                Text(L("Mac与iPhone需位于同一局域网，并在两端确认蓝牙配对码。Mac使用以太网时，请手动填写iPhone所连Wi-Fi的SSID、共享密码和实际信道。802.1X企业Wi-Fi不支持此无线握手，请使用个人Wi-Fi、热点或USB。")).font(.callout).foregroundStyle(.secondary)
                             }
                         }
                     case .display:
                         Section(L("显示器")) {
-                            Picker(L("显示位置"),selection:Binding(get:{model.settings.displayID ?? model.displays.first?.id ?? 0},set:{model.settings.displayID=$0;model.updateResolution()})) {
+                            Picker(L("显示位置"),selection:Binding(get:{model.settings.displayID ?? model.displays.first?.id ?? 0},set:{model.selectDisplay($0)})) {
                                 ForEach(model.displays){Text($0.label).tag($0.id)}
                             }
                             if let panel=model.displays.first(where:{$0.id==model.settings.displayID}) {Text(L(panel.details)).font(.callout).foregroundStyle(.secondary)}
+                            if !model.displayStatus.isEmpty {Text(L(model.displayStatus)).font(.callout).foregroundStyle(.secondary)}
+                            Button(L("刷新显示器")){model.refreshDisplays()}.disabled(model.displayLoading)
                             Text(L("默认内建显示器；切换显示器后应用并重新连接。")).font(.callout).foregroundStyle(.secondary)
                         }
                         Section(L("视频分辨率")) {
                             Picker(L("分辨率"),selection:$model.settings.resolution) {
-                                Text(L("屏幕原生像素（避开刘海）")).tag("native")
+                                Text(L("屏幕原生像素（避开刘海）")).tag("native").disabled(!model.exactDisplayAvailable)
                                 ForEach(["1280x720","1920x1080","2560x1440"],id:\.self){Text($0.replacingOccurrences(of:"x",with:"×")).tag($0)}
                                 Text(L("自定义")).tag("custom")
                             }.onChange(of:model.settings.resolution){_,_ in model.updateResolution()}
@@ -810,25 +1128,33 @@ struct SettingsView: View {
                                 TextField(L("宽度（像素）"),value:$model.settings.width,format:.number)
                                 TextField(L("高度（像素）"),value:$model.settings.height,format:.number)
                             }
-                            Toggle(L("严格按屏幕物理像素显示"),isOn:Binding(get:{model.settings.strictPixels ?? false},set:{model.settings.strictPixels=$0})).disabled(model.settings.resolution == "native")
+                            Toggle(L("严格按屏幕物理像素显示"),isOn:Binding(get:{model.settings.strictPixels ?? false},set:{model.settings.strictPixels=$0})).disabled(model.settings.resolution == "native" || (!model.exactDisplayAvailable && model.settings.strictPixels != true))
                             LabeledContent(L("请求像素"),value:"\(model.settings.width)×\(model.settings.height)")
                             Text(L("原生像素模式全屏显示。关闭严格像素显示后，窗口适配屏幕并可等比例调整大小，不改变请求分辨率。")).font(.callout).foregroundStyle(.secondary)
                         }
                         Section(L("流畅度")) {
                             Picker(L("最高帧率"),selection:$model.settings.fps){ForEach([30,60,90,120],id:\.self){Text(L("\($0)fps")).tag($0)}}
-                            Text(L("高帧率为实验请求：120fps协商失败后改用90fps，90fps仍失败则改用60fps。发起CarPlay连接后20秒未启动视频视为失败。")).font(.callout).foregroundStyle(.secondary)
+                            Text(L("高帧率为实验请求：120fps视频启动失败后尝试90fps，再失败则尝试60fps。")).font(.callout).foregroundStyle(.secondary)
+                            DisclosureGroup(L("接收统计")) {
+                                LabeledContent(L("请求帧率"),value:"\(model.settings.fps)fps")
+                                LabeledContent(L("本次尝试"),value:"\(model.attemptedFPS)fps")
+                                LabeledContent(L("实际接收"),value:model.statisticFPS("receivedFps"))
+                                LabeledContent(L("解码输出"),value:model.statisticFPS("decodedFps"))
+                                LabeledContent(L("视频尺寸"),value:model.videoStatisticsText)
+                            }
                             if !model.frameRateFallbackNote.isEmpty {Text(L(model.frameRateFallbackNote)).font(.callout).foregroundStyle(.secondary)}
-                            Text(L("上报所选分辨率与固定窗口对应的真实物理尺寸，不提供倍率调节。请关闭CarPlay自身的“智能缩放显示”以避免自动缩放。帧率为请求上限。")).font(.callout).foregroundStyle(.secondary)
+                            Text(L("分辨率决定请求的视频尺寸。CarPlay内的“智能缩放显示”会影响实际输出，帧率为请求上限。")).font(.callout).foregroundStyle(.secondary)
                         }
                     case .audio:
                         Section(L("CarPlay声音")) {
                             Toggle(L("播放iPhone音频"),isOn:$model.settings.audioEnabled).onChange(of:model.settings.audioEnabled){_,_ in model.applyLiveAudio()}
                             LabeledContent(L("媒体音量")){Slider(value:$model.settings.volume,in:0...1).onChange(of:model.settings.volume){_,_ in model.applyLiveAudio()};Text(L("\(Int(model.settings.volume*100))%")).monospacedDigit().frame(width:42)}
                             LabeledContent(L("通话音量")){Slider(value:Binding(get:{model.settings.callVolume ?? 1},set:{model.settings.callVolume=$0;model.applyLiveAudio()}),in:0...1);Text(L("\(Int((model.settings.callVolume ?? 1)*100))%")).monospacedDigit().frame(width:42)}
-                            Picker(L("输出设备"),selection:Binding(get:{model.settings.outputDevice ?? ""},set:{model.settings.outputDevice=$0})) {Text(L("系统默认设备")).tag("");ForEach(model.audioOutputs){Text($0.name).tag($0.id)}}
-                            Picker(L("输入设备"),selection:Binding(get:{model.settings.inputDevice ?? ""},set:{model.settings.inputDevice=$0})) {Text(L("系统默认设备")).tag("");ForEach(model.audioInputs){Text($0.name).tag($0.id)}}
-                            Button(L("刷新设备")){model.refreshHardware()}
-                            Text(L("媒体与通话音量实时生效；设备切换后应用并重新连接。默认跟随系统设备，麦克风使用需要系统授权。")).font(.callout).foregroundStyle(.secondary)
+                            Picker(L("输出设备"),selection:Binding(get:{model.settings.outputDevice ?? ""},set:{model.settings.outputDevice=$0;model.applyAudioDevices(inputChanged:false)})) {Text(L("系统默认设备")).tag("");ForEach(model.audioOutputs){Text($0.name).tag($0.id)}}
+                            Picker(L("输入设备"),selection:Binding(get:{model.settings.inputDevice ?? ""},set:{model.settings.inputDevice=$0;model.applyAudioDevices(outputChanged:false)})) {Text(L("系统默认设备")).tag("");ForEach(model.audioInputs){Text($0.name).tag($0.id)}}
+                            Button(L("刷新设备")){model.audioHardwareChanged(inputChanged:true,outputChanged:true)}
+                            LabeledContent(L("音频格式"),value:model.audioFormatText)
+                            Text(L("媒体与通话音量、输入输出设备实时生效。麦克风使用需要系统授权。")).font(.callout).foregroundStyle(.secondary)
                         }
                     case .about:
                         MacPlayAboutView(model:model,updates:updates)
@@ -840,7 +1166,7 @@ struct SettingsView: View {
                     if model.receivingOrWaiting {Button(L("停止接收")){model.stop()}}
                     if model.running {Button(L("显示画面")){model.showCarPlayWindow()}}
                     Spacer()
-                    Button(L(model.running ? "应用并重新连接" : "启动接收")){model.start()}.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    Button(L(model.running ? "应用并重新连接" : "启动接收")){model.start()}.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(model.preparingConnection)
                 }.padding(16)
                 }
             }.navigationTitle(L((model.page ?? .connection).rawValue))

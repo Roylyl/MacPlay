@@ -15,9 +15,13 @@ const OP_VIDEO_CONFIG: u8 = 1;
 const MAX_BODY: usize = 8 * 1024 * 1024;
 const TAG_LEN: usize = 16;
 
-/// A body size beyond `MAX_BODY`. The caller drops the connection.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Implausible(pub usize);
+/// Fatal framing or authentication failure. The caller must close this TCP
+/// connection; only reset() for a newly accepted connection clears the error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamError {
+    Implausible(usize),
+    AuthenticationFailed { counter: u64 },
+}
 
 /// What a stream reports as it reads: the codec and its configuration record,
 /// every decrypted frame, and the first frame of a connection.
@@ -32,12 +36,13 @@ pub struct ScreenStream {
     counter: u64,
     acc: Vec<u8>,
     started: bool,
+    failed: Option<StreamError>,
     sink: Box<dyn ScreenSink>,
 }
 
 impl ScreenStream {
     pub fn new(key: [u8; 32], sink: Box<dyn ScreenSink>) -> Self {
-        Self { key, counter: 0, acc: Vec::new(), started: false, sink }
+        Self { key, counter: 0, acc: Vec::new(), started: false, failed: None, sink }
     }
 
     /// Forgets a half-received message and starts the nonce over.
@@ -45,10 +50,12 @@ impl ScreenStream {
         self.acc.clear();
         self.counter = 0;
         self.started = false;
+        self.failed = None;
     }
 
     /// Takes the next chunk and reports every message it completes.
-    pub fn push(&mut self, chunk: &[u8]) -> Result<(), Implausible> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), StreamError> {
+        if let Some(error) = self.failed { return Err(error); }
         self.acc.extend_from_slice(chunk);
         loop {
             if self.acc.len() < HEADER_LEN {
@@ -58,17 +65,23 @@ impl ScreenStream {
                 self.acc[0], self.acc[1], self.acc[2], self.acc[3],
             ]) as usize;
             if body_size > MAX_BODY {
-                return Err(Implausible(body_size));
+                let error = StreamError::Implausible(body_size);
+                self.failed = Some(error);
+                return Err(error);
             }
             if self.acc.len() < HEADER_LEN + body_size {
                 return Ok(());
             }
-            self.handle(body_size);
+            if let Err(error) = self.handle(body_size) {
+                self.failed = Some(error);
+                self.acc.clear();
+                return Err(error);
+            }
             self.acc.drain(..HEADER_LEN + body_size);
         }
     }
 
-    fn handle(&mut self, body_size: usize) {
+    fn handle(&mut self, body_size: usize) -> Result<(), StreamError> {
         let opcode = self.acc[4];
         let (header, rest) = self.acc.split_at(HEADER_LEN);
         let body = &rest[..body_size];
@@ -76,18 +89,18 @@ impl ScreenStream {
         if opcode == OP_VIDEO_CONFIG {
             let (codec, offset) = detect_codec(body);
             self.sink.on_config(codec, &body[offset..]);
-            return;
+            return Ok(());
         }
         if opcode != OP_VIDEO_FRAME {
-            return;
+            return Ok(());
         }
 
         // Short bodies carry no tag and travel in the clear.
         let opened;
         let frame: &[u8] = if body.len() >= TAG_LEN {
             let Some(plain) = Self::open(&self.key, self.counter, header, body) else {
-                eprintln!("[cp_screen] frame auth failed at counter {}", self.counter);
-                return;
+                eprintln!("[cp_screen] frame auth failed at counter {}, closing video connection", self.counter);
+                return Err(StreamError::AuthenticationFailed { counter: self.counter });
             };
             self.counter += 1;
             opened = plain;
@@ -101,6 +114,7 @@ impl ScreenStream {
             self.sink.on_started();
         }
         self.sink.on_frame(frame);
+        Ok(())
     }
 
     /// Decrypts the body of message `counter`, with the header as associated
@@ -211,19 +225,29 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_that_fails_authentication_is_dropped_and_the_counter_stays() {
+    fn authentication_failure_closes_the_connection_without_advancing_the_nonce() {
         let seen = Seen::default();
         let mut s = stream(&seen);
         let mut bad = sealed_frame(0, b"first");
         *bad.last_mut().unwrap() ^= 0xff;
-
-        s.push(&bad).unwrap();
+        // A later valid frame in the same read must not hide the fatal failure.
+        bad.extend(sealed_frame(0, b"must not appear"));
+        let error = StreamError::AuthenticationFailed { counter: 0 };
+        assert_eq!(s.push(&bad), Err(error));
         assert!(seen.frames().is_empty());
         assert_eq!(seen.started(), 0);
+        assert_eq!(s.counter, 0);
+        assert_eq!(s.push(&sealed_frame(0, b"still retired")), Err(error));
+        assert!(seen.frames().is_empty());
 
-        // the next frame still counts as the first
+        // The TCP receiver accepts a new connection and resets its framing and
+        // nonce counter. A fresh authenticated stream can then start normally.
+        s.reset();
         s.push(&sealed_frame(0, b"again")).unwrap();
-        assert_eq!(seen.frames(), vec![b"again".to_vec()]);
+        s.push(&sealed_frame(1, b"second")).unwrap();
+        assert_eq!(seen.frames(), vec![b"again".to_vec(), b"second".to_vec()]);
+        assert_eq!(seen.started(), 1);
+        assert_eq!(s.counter, 2);
     }
 
     #[test]
@@ -269,7 +293,7 @@ mod tests {
         let mut m = vec![0u8; HEADER_LEN];
         m[..4].copy_from_slice(&(MAX_BODY as u32 + 1).to_le_bytes());
 
-        assert_eq!(s.push(&m), Err(Implausible(MAX_BODY + 1)));
+        assert_eq!(s.push(&m), Err(StreamError::Implausible(MAX_BODY + 1)));
     }
 
     #[test]
@@ -396,11 +420,15 @@ pub mod receiver {
             };
             match read {
                 Ok(0) | Err(_) => drop_client(&stream),
-                Ok(n) => match stream.borrow_mut().push(&chunk[..n]) {
-                    Ok(()) => glib::ControlFlow::Continue,
-                    Err(super::Implausible(size)) => {
-                        eprintln!("[cp_screen] implausible bodySize {size}, dropping connection");
-                        drop_client(&stream)
+                Ok(n) => {
+                    // Release the mutable borrow before drop_client resets it.
+                    let result = stream.borrow_mut().push(&chunk[..n]);
+                    match result {
+                        Ok(()) => glib::ControlFlow::Continue,
+                        Err(error) => {
+                            eprintln!("[cp_screen] {error:?}, dropping connection");
+                            drop_client(&stream)
+                        }
                     }
                 },
             }

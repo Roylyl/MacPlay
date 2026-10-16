@@ -55,7 +55,7 @@ pub fn build_identification(
         model_identifier: if id.name == "MacPlay" {"MacPlay"} else {"LIVI"}.into(),
         manufacturer: if id.name == "MacPlay" {"MacPlay"} else {"LIVI"}.into(),
         serial_number: if id.name == "MacPlay" {std::env::var("MACPLAY_SERIAL").expect("MacPlay requires a persistent accessory serial")} else {"0123456".into()},
-        firmware_version: if id.name == "MacPlay" {"1.2.2"} else {"1.0.0"}.into(),
+        firmware_version: if id.name == "MacPlay" {"1.2.3"} else {"1.0.0"}.into(),
         hardware_version: "1.0".into(),
         messages_sent_by_accessory: ids(&sent),
         messages_received_from_accessory: ids(RECEIVED),

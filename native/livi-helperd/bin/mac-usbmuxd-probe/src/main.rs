@@ -20,6 +20,7 @@ mod mac {
         let cp = CpConfig {
             ap_mac: None,
             ap_on_air: None,
+            wireless_handoff: None,
             wifi_iface: String::new(),
             ssid: "LIVI".into(),
             passphrase: "12345678".into(),

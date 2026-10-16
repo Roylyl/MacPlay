@@ -2,6 +2,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <AVFoundation/AVFoundation.h>
+#import <objc/runtime.h>
 #include <atomic>
 #include <math.h>
 #include <deque>
@@ -215,10 +216,84 @@ static void mpApplyRenderScale(NSView *view) {
   for (NSView *child in view.subviews) mpApplyRenderScale(child);
 }
 
+// GStreamer's Cocoa sink invalidates its NSView from the streaming thread.
+// AppKit can then race its visible-rectangle cache against a window resize.
+// Keep this adapter on GstGLNSView only, installed before the sink starts.
+@interface MacPlayGLRedrawRequest : NSObject {
+@public
+  std::atomic<bool> pending;
+  std::atomic<bool> needsDisplay;
+}
+@end
+@implementation MacPlayGLRedrawRequest
+- (instancetype)init {
+  if ((self = [super init])) { pending.store(false); needsDisplay.store(false); }
+  return self;
+}
+@end
+
+static void (*mpGLSetNeedsDisplay)(id, SEL, BOOL);
+static void (*mpGLSetNeedsDisplayInRect)(id, SEL, NSRect);
+static char mpGLRedrawRequestKey;
+
+static void mpQueueGLRedraw(NSView *view, BOOL needsDisplay) {
+  MacPlayGLRedrawRequest *request;
+  @synchronized (view) {
+    request = objc_getAssociatedObject(view, &mpGLRedrawRequestKey);
+    if (!request) {
+      request = [[MacPlayGLRedrawRequest alloc] init];
+      objc_setAssociatedObject(view, &mpGLRedrawRequestKey, request, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+      [request release];
+    }
+    request->needsDisplay.store(needsDisplay);
+    if (request->pending.exchange(true)) return;
+  }
+  // Never wait for the main thread: it can be stopping this same pipeline.
+  // The copied block retains both objects until the pending redraw completes.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    BOOL display;
+    @synchronized (view) {
+      display = request->needsDisplay.load();
+      request->pending.store(false);
+    }
+    if (!view.window) return;
+    [CATransaction begin];
+    mpGLSetNeedsDisplay(view, @selector(setNeedsDisplay:), display);
+    [CATransaction commit];
+  });
+}
+
+static void mpGLNeedsDisplay(NSView *view, SEL selector, BOOL needsDisplay) {
+  if ([NSThread isMainThread]) mpGLSetNeedsDisplay(view, selector, needsDisplay);
+  else mpQueueGLRedraw(view, needsDisplay);
+}
+
+static void mpGLNeedsDisplayInRect(NSView *view, SEL selector, NSRect rect) {
+  if ([NSThread isMainThread]) mpGLSetNeedsDisplayInRect(view, selector, rect);
+  else mpQueueGLRedraw(view, YES);
+}
+
+static void mpInstallGLMainThreadRedraw() {
+  static bool installed = false;
+  if (installed) return;
+  NSCAssert(NSThread.isMainThread, @"Install the GL view adapter on the main thread");
+  Class viewClass = NSClassFromString(@"GstGLNSView");
+  if (!viewClass) return;
+  SEL display = @selector(setNeedsDisplay:), rect = @selector(setNeedsDisplayInRect:);
+  Method displayMethod = class_getInstanceMethod(viewClass, display);
+  Method rectMethod = class_getInstanceMethod(viewClass, rect);
+  mpGLSetNeedsDisplay = (void (*)(id, SEL, BOOL))method_getImplementation(displayMethod);
+  mpGLSetNeedsDisplayInRect = (void (*)(id, SEL, NSRect))method_getImplementation(rectMethod);
+  class_replaceMethod(viewClass, display, (IMP)mpGLNeedsDisplay, method_getTypeEncoding(displayMethod));
+  class_replaceMethod(viewClass, rect, (IMP)mpGLNeedsDisplayInRect, method_getTypeEncoding(rectMethod));
+  installed = true;
+}
+
 @interface MacPlayRenderHostView : NSView
 @end
 @implementation MacPlayRenderHostView
 - (void)didAddSubview:(NSView *)subview {
+  mpInstallGLMainThreadRedraw();
   [super didAddSubview:subview];mpApplyRenderScale(subview);
 }
 - (void)viewDidMoveToWindow {
@@ -232,16 +307,6 @@ static void mpApplyRenderScale(NSView *view) {
 extern "C" void macplay_select_display(uint32_t id) {mpDisplayID=id;}
 extern "C" void macplay_set_language(const char *language) {mpLanguage=language ?: "";}
 extern "C" int macplay_take_window_action() {int action=mpWindowAction;mpWindowAction=0;return action;}
-extern "C" void macplay_close_window() {
- mpClosingWindow=true;
- if(macplayWindow){
-  if(NSWindow *sheet=macplayWindow.attachedSheet){[NSApp endSheet:sheet returnCode:NSModalResponseCancel];[sheet orderOut:nil];}
-  [[NSNotificationCenter defaultCenter] removeObserver:mpWindowDelegate];
-  [macplayWindow setDelegate:nil];[macplayWindow orderOut:nil];[macplayWindow close];macplayWindow=nil;mpWindowDelegate=nil;
- }
- mpWindowAction=0;mpCloseRequested=false;mpClosePromptOpen=false;
- mpEnteringFullscreen=false;mpHideAfterFullscreen=false;
-}
 extern "C" void macplay_configure_window(double width, double height,
     double panelWidth, double panelHeight, bool fullscreen, bool strict) {
   if (!isfinite(width) || !isfinite(height) || !isfinite(panelWidth) ||
@@ -330,6 +395,7 @@ extern "C" void macplay_configure_window(double width, double height,
 @end
 
 extern "C" guintptr livi_attach_view(guintptr parent, void** outView) {
+  mpInstallGLMainThreadRedraw();
   *outView = nullptr;
   NSView* p = (NSView*)(void*)parent;
   if (!p) return parent;
@@ -726,6 +792,21 @@ static void mpQueue(double x,double y,int down) {mpInputs.push_back({x,y,down});
  }
 }
 @end
+extern "C" void macplay_close_window() {
+ mpClosingWindow=true;
+ if(macplayWindow){
+  MacPlayInputView *view=(MacPlayInputView *)macplayWindow.contentView;
+  [view releaseInput:nil];
+  [[NSNotificationCenter defaultCenter] removeObserver:view];
+  if(NSWindow *sheet=macplayWindow.attachedSheet){[NSApp endSheet:sheet returnCode:NSModalResponseCancel];[sheet orderOut:nil];}
+  [[NSNotificationCenter defaultCenter] removeObserver:mpWindowDelegate];
+  [macplayWindow setDelegate:nil];[macplayWindow orderOut:nil];[macplayWindow close];macplayWindow=nil;mpWindowDelegate=nil;
+ }
+ mpInputs.clear();
+ mpWindowAction=0;mpCloseRequested=false;mpClosePromptOpen=false;
+ mpEnteringFullscreen=false;mpHideAfterFullscreen=false;
+}
+
 static uintptr_t mpWindow(double aspect, bool present) {
  [MacPlayVideoApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
  if(!macplayWindow || fabs(mpAspect-aspect)>0.0001)mpSetWindowAspect(aspect);
@@ -767,7 +848,11 @@ static uintptr_t mpWindow(double aspect, bool present) {
  [macplayWindow orderFrontRegardless];
  if(mpDefaultFullscreen && !(macplayWindow.styleMask & NSWindowStyleMaskFullScreen) && !mpEnteringFullscreen) {
   mpEnteringFullscreen=true;
-  dispatch_async(dispatch_get_main_queue(), ^{[macplayWindow toggleFullScreen:nil];});
+  dispatch_async(dispatch_get_main_queue(), ^{
+   if(macplayWindow!=presentedWindow || mpClosingWindow)return;
+   if(presentedWindow.isVisible)[presentedWindow toggleFullScreen:nil];
+   else mpEnteringFullscreen=false;
+  });
  } else if(!mpEnteringFullscreen) mpLogWindow();
  return (uintptr_t)macplayWindow.contentView;
 }

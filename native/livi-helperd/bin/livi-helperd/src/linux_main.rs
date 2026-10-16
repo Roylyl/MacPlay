@@ -259,6 +259,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         ),
         ap_mac: ap_mac.clone(),
         ap_on_air: dongle_ap.then_some(livi_dongle::ap::on_air as AskOnAir),
+        wireless_handoff: None,
     };
     let pk = std::env::var("LIVI_CP_PK").unwrap_or_default();
     let pi = std::env::var("LIVI_CP_PI").unwrap_or_default();

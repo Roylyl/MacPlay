@@ -29,3 +29,9 @@ pub fn close(id: u32) {
         eprintln!("[cp_mic] uplink 0x{id:x} close");
     }
 }
+
+/// Reopen the existing sender; its nonce and RTP counters must never reset.
+pub fn set_device(id: u32, device: Option<&str>) -> bool {
+    uplinks().lock().unwrap_or_else(|e|e.into_inner()).get(&id)
+        .is_some_and(|uplink|uplink.set_device(device))
+}

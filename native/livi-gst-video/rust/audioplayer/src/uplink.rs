@@ -9,7 +9,7 @@ use gstreamer_app as gst_app;
 use gst::prelude::*;
 use livi_audio_uplink::{seal_packet, to_wire_pcm, Counters, UplinkCodec, RTP_HEADER_LEN};
 use std::net::UdpSocket;
-use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
+use std::sync::{Arc,Mutex,atomic::{AtomicBool,AtomicU64,Ordering}};
 
 /// What the phone negotiated for its microphone stream.
 pub struct UplinkConfig {
@@ -75,6 +75,9 @@ pub fn pipeline_desc(cfg: &UplinkConfig) -> String {
 pub struct Uplink {
     live: Arc<AtomicBool>,
     pipeline: gst::Pipeline,
+    generation: Arc<AtomicU64>,
+    transition: Arc<Mutex<()>>,
+    state: Arc<Mutex<(Counters, Vec<u8>)>>,
 }
 
 impl Uplink {
@@ -100,7 +103,10 @@ impl Uplink {
         let target = format!("{}:{}", cfg.phone, cfg.port);
         let samples = cfg.samples_per_packet();
         let frame_bytes = (samples * u32::from(cfg.channels) * 2) as usize;
-        let state = Mutex::new((Counters::default(), Vec::<u8>::new()));
+        let state = Arc::new(Mutex::new((Counters::default(), Vec::<u8>::new())));
+        let capture_state = state.clone();
+        let generation = Arc::new(AtomicU64::new(0));
+        let transition = Arc::new(Mutex::new(()));
 
         let live=Arc::new(AtomicBool::new(true));
         let callback_live=live.clone();
@@ -117,7 +123,7 @@ impl Uplink {
                     let Ok(map) = buffer.map_readable() else {
                         return Ok(gst::FlowSuccess::Ok);
                     };
-                    let Ok(mut guard) = state.lock() else {
+                    let Ok(mut guard) = capture_state.lock() else {
                         return Ok(gst::FlowSuccess::Ok);
                     };
                     if !callback_live.load(Ordering::Acquire){return Err(gst::FlowError::Flushing)}
@@ -156,16 +162,40 @@ impl Uplink {
         if let Some(bus)=pipeline.bus() {
             let weak=pipeline.downgrade();
             let failed=live.clone();
+            let error_generation=generation.clone();
+            let error_transition=transition.clone();
             bus.set_sync_handler(move |_,message| {
                 if let gst::MessageView::Error(error)=message.view() {
                     failed.store(false,Ordering::Release);
                     eprintln!("[cp_mic] capture/encoder failed: {}",error.error());
-                    if let Some(p)=weak.upgrade(){p.call_async(|p|{let _=p.set_state(gst::State::Null);});}
+                    let revision=error_generation.load(Ordering::Acquire);
+                    let current=error_generation.clone();
+                    let transition=error_transition.clone();
+                    if let Some(p)=weak.upgrade(){p.call_async(move |p|{
+                        let _guard=transition.lock().unwrap_or_else(|e|e.into_inner());
+                        if current.load(Ordering::Acquire)==revision {let _=p.set_state(gst::State::Null);}
+                    });}
                 }
                 gst::BusSyncReply::Drop
             });
         }
-        Some(Self { pipeline,live })
+        Some(Self { pipeline,live,generation,transition,state })
+    }
+
+    /// Reopen the capture device without replacing the encrypted RTP sender.
+    /// Sequence/timestamp/nonce counters deliberately survive this restart.
+    pub fn set_device(&self, device: Option<&str>) -> bool {
+        let _guard=self.transition.lock().unwrap_or_else(|e|e.into_inner());
+        self.live.store(false,Ordering::Release);
+        self.generation.fetch_add(1,Ordering::AcqRel);
+        if self.pipeline.set_state(gst::State::Null).is_err(){return false}
+        // An old bus error may have arrived while Null was shutting down.
+        self.generation.fetch_add(1,Ordering::AcqRel);
+        if let Ok(mut state)=self.state.lock(){state.1.clear();}
+        let Some(source)=self.pipeline.by_name(SOURCE_NAME) else{return false};
+        source.set_property(source_device_property(),device.filter(|d|!d.is_empty()));
+        self.live.store(true,Ordering::Release);
+        self.start()
     }
 
     pub fn start(&self) -> bool {

@@ -113,6 +113,12 @@ export class CpHelperSock implements MfiSigner {
     if (!response.ok) throw new CpHelperSockError(response.error)
   }
 
+  /** Cancel the pending wireless address retry as soon as a control connection arrives. */
+  async networkConnected(): Promise<void> {
+    const res = await this.request('network-connected')
+    if (!res.ok) throw new CpHelperSockError(res.error)
+  }
+
   /** Ends the wired iAP2 sessions, so the phones open them again. */
   async dropIap2(): Promise<void> {
     const res = await this.request('drop-iap2')

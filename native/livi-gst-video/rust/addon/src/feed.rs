@@ -63,6 +63,13 @@ pub fn forget_stream(id: u32) {
     lock().fans.remove(&id);
 }
 
+/// A replacement decoder must start at a fresh keyframe, not a stale cached GOP.
+pub fn restart_video(id: u32) {
+    if let Some(Some(fan)) = lock().fans.get_mut(&id) {
+        fan.restart();
+    }
+}
+
 /// Notes the codec a received stream announces; an existing gate keeps its cache.
 pub fn note_receiver_codec(id: u32, codec: CpCodec) {
     let mut reg = lock();

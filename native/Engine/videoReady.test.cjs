@@ -1,9 +1,9 @@
 const {test}=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs')
 function fixture(){
  const configs=[],players=[],shown=[],stopped=[];let ready=0
- const addon={openVideoReceiver(id,key,cb){configs.push(cb);return 1234},closeVideoReceiver(){},macplayPrepareVideoWindow(){return Buffer.alloc(8)},createPlayer(){const p={size:[0,0]};players.push(p);return p},start(){},stop(p){stopped.push(p)},setContentRegion(){},decodedVideoSize:p=>p.size,macplayWindowHandle:aspect=>shown.push(aspect),macplayCloseVideoWindow(){}}
+ const addon={openVideoReceiver(id,key,cb){configs.push(cb);return 1234},closeVideoReceiver(){},macplayPrepareVideoWindow(){return Buffer.alloc(8)},createPlayer(){const p={size:[0,0]};players.push(p);return p},start(){},stop(p){stopped.push(p)},setContentRegion(){},decodedVideoSize:p=>p.size,decodedVideoStatistics:p=>({decodedFrames:p.size[0]?1:0,errors:0,width:p.size[0],height:p.size[1],decoder:'fixture'}),videoReceiverStatistics:()=>[1,100,1,1,0,0],macplayWindowHandle:aspect=>shown.push(aspect),macplayCloseVideoWindow(){}}
  const m={exports:{}}
- vm.runInNewContext(fs.readFileSync('build/engine/media.js','utf8'),{module:m,exports:m.exports,require(id){if(id==='livi-gst-video')return addon;if(id==='node:fs')return {...fs,existsSync:()=>true};if(id.startsWith('node:'))return require(id);return {}},process:{env:{MACPLAY_RESOURCES:'/fixture'},arch:'arm64'},__dirname:'/fixture',console:{log(){},warn(){}}})
+ vm.runInNewContext(fs.readFileSync('build/engine/media.js','utf8'),{module:m,exports:m.exports,require(id){if(id==='livi-gst-video')return addon;if(id==='node:fs')return {...fs,existsSync:()=>true};if(id==='./videoHealth')return require('../../build/engine/videoHealth.js');if(id.startsWith('node:'))return require(id);return {}},process:{env:{MACPLAY_RESOURCES:'/fixture'},arch:'arm64'},__dirname:'/fixture',console:{log(){},warn(){}}})
  const media=m.exports;media.setVideoCallback(()=>ready++,16/9)
  return {media,configs,players,shown,stopped,get ready(){return ready}}
 }

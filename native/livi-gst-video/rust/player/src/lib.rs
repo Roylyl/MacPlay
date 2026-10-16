@@ -29,12 +29,13 @@ pub fn ensure_init() {
 
 /// Prints errors and warnings the pipeline reports, and leaves the message on
 /// the bus for anyone else.
-pub fn log_bus_messages(pipeline: &gst::Pipeline) {
+fn log_bus_messages(pipeline: &gst::Pipeline, errors: std::sync::Arc<std::sync::atomic::AtomicU64>) {
     let Some(bus) = pipeline.bus() else { return };
-    bus.set_sync_handler(|_, msg| {
+    bus.set_sync_handler(move |_, msg| {
         let src = msg.src().map(|s| s.name().to_string()).unwrap_or_default();
         match msg.view() {
             gst::MessageView::Error(e) => {
+                errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
                     "[gst_video] ERROR from {src}: {} | {}",
                     e.error(),
@@ -203,6 +204,9 @@ unsafe extern "C" {
 /// window view it draws into.
 pub struct Player {
     decoded_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    decoded_frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    errors: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    decoder: String,
     pipeline: gst::Pipeline,
     appsrc: Option<gst_app::AppSrc>,
     glshader: Option<gst::Element>,
@@ -219,9 +223,14 @@ impl Player {
     /// Builds the pipeline for `codec` and hangs it in the window `handle`
     /// names. None when no decoder is registered or the description fails.
     pub fn new(codec: &str, handle: usize, codec_data: &[u8]) -> Option<Self> {
+        Self::new_with_decoder(codec, handle, codec_data, false)
+    }
+
+    /// Recovery may explicitly choose software without changing process-wide preferences.
+    pub fn new_with_decoder(codec: &str, handle: usize, codec_data: &[u8], software: bool) -> Option<Self> {
         ensure_init();
 
-        let sw_only = std::env::var_os("LIVI_GST_SWDEC").is_some();
+        let sw_only = software || std::env::var_os("LIVI_GST_SWDEC").is_some();
         let decoder = livi_video_codec::decoder_candidates(codec, sw_only)
             .iter()
             .filter_map(|name| name.to_str().ok())
@@ -247,10 +256,14 @@ impl Player {
         }
 
         let decoded_size = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let decoded_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let errors = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         if let Some(pad) = pipeline.by_name("dec").and_then(|dec| dec.static_pad("src")) {
             let size = decoded_size.clone();
+            let frames = decoded_frames.clone();
             pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
                 if info.buffer().is_some() {
+                    frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(caps) = pad.current_caps() {
                         if let Ok(video) = gstreamer_video::VideoInfo::from_caps(&caps) {
                             size.store(((video.width() as u64) << 32) | video.height() as u64, std::sync::atomic::Ordering::Release);
@@ -262,6 +275,9 @@ impl Player {
         }
         let mut player = Self {
             decoded_size,
+            decoded_frames,
+            errors,
+            decoder: decoder.to_owned(),
             glshader: pipeline.by_name("cal"),
             #[cfg(target_os = "macos")]
             sink: pipeline.by_name("sink"),
@@ -291,7 +307,7 @@ impl Player {
             }
             install_decoder_probes(&dec, decoder);
         }
-        log_bus_messages(&player.pipeline);
+        log_bus_messages(&player.pipeline, player.errors.clone());
         player.attach_view(handle);
 
         Some(player)
@@ -356,6 +372,12 @@ impl Player {
     pub fn decoded_size(&self) -> (u32, u32) {
         let value = self.decoded_size.load(std::sync::atomic::Ordering::Acquire);
         ((value >> 32) as u32, value as u32)
+    }
+
+    pub fn statistics(&self) -> (u64, u64, &str, bool) {
+        (self.decoded_frames.load(std::sync::atomic::Ordering::Relaxed),
+         self.errors.load(std::sync::atomic::Ordering::Relaxed), &self.decoder,
+         !livi_video_codec::is_hw_decoder(&self.decoder))
     }
 
     pub fn start(&self) {

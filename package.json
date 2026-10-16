@@ -1,13 +1,13 @@
 {
   "name": "macplay",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "private": true,
   "description": "MacPlay原生macOS CarPlay接收端",
   "license": "GPL-3.0-or-later",
   "scripts": {
     "build": "bash scripts/build-macplay.sh",
     "build:engine": "tsc -p native/Engine/tsconfig.json",
-    "test": "node --test native/Engine/display.test.cjs native/Engine/frameRateFallback.test.cjs native/Engine/identity.test.cjs native/Engine/phoneSelection.test.cjs native/Engine/runtimeControls.test.cjs native/Engine/sessionLifecycle.test.cjs"
+    "test": "node --test native/Engine/*.test.cjs"
   },
   "dependencies": {
     "livi-crypto": "workspace:*",
