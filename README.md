@@ -21,6 +21,8 @@
 
 <p align="center"><a href="#快速入门">快速入门</a> · <a href="#主要功能">主要功能</a> · <a href="#其他平台">其他平台</a> · <a href="#从源码构建">源码构建</a> · <a href="#来源与许可">来源与许可</a></p>
 
+<p align="center">其他平台：<a href="https://github.com/Roylyl/WinPlay">Windows</a> · <a href="https://github.com/Roylyl/LinuxPlay">Linux</a> · <a href="https://github.com/Roylyl/AndroidPlay">Android</a></p>
+
 ## 快速入门
 
 ### 使用条件
@@ -135,10 +137,13 @@ pnpm run build -- --arch=x64
 
 ## 其他平台
 
-| 项目 | 平台 | 连接方式 |
+如果需要在其他设备上使用CarPlay，可以选择对应平台的项目。
+
+| 项目 | 适用平台 | 连接方式 |
 | --- | --- | --- |
-| [WinPlay](https://github.com/Roylyl/WinPlay) | Windows10/11x64 | 移动热点或局域网无线CarPlay |
-| [AndroidPlay](https://github.com/Roylyl/AndroidPlay) | Android9及以上 | 系统热点与蓝牙连接iPhone |
+| [WinPlay](https://github.com/Roylyl/WinPlay) | Windows10/11x64 | 本机移动热点或现有局域网无线连接 |
+| [LinuxPlay](https://github.com/Roylyl/LinuxPlay) | Linux桌面（X11/XWayland） | 本机热点或现有局域网无线连接 |
+| [AndroidPlay](https://github.com/Roylyl/AndroidPlay) | Android9及以上 | 系统热点与蓝牙无线连接 |
 
 ## 来源与许可
 
