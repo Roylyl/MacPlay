@@ -76,7 +76,7 @@ fn cp_config() -> (CpConfig, Identity) {
 
 async fn direct_bluetooth(auth: SharedCoprocessor, identity: Identity, mut cp: CpConfig,
     bcast: Broadcaster, state: Arc<HelperState>) {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::var("MACPLAY_AUTH_DIR").unwrap_or_default();
     let path = std::path::Path::new(&dir).join("bluetooth.sock");
@@ -91,15 +91,30 @@ async fn direct_bluetooth(auth: SharedCoprocessor, identity: Identity, mut cp: C
     cp.av_iface = Some(cp.wifi_iface.clone());
     if cp.ssid.is_empty() { eprintln!("[MacPlay] Wireless setup needs the shared Wi-Fi SSID; Bluetooth discovery remains enabled"); }
     let bin = std::env::current_exe().unwrap().with_file_name("macplay-bluetooth");
-    let mut child = match tokio::process::Command::new(bin).arg(&path).kill_on_drop(true).spawn() {
+    let mut child = match tokio::process::Command::new(bin).arg(&path)
+        .stdin(std::process::Stdio::piped()).kill_on_drop(true).spawn() {
         Ok(v) => v, Err(e) => { eprintln!("[MacPlay] Bluetooth bridge: {e}"); return; }
     };
+    if let (Some(handoff), Some(mut input)) = (&cp.wireless_handoff, child.stdin.take()) {
+        let mut updates = handoff.connection_updates();
+        tokio::spawn(async move {
+            while !*updates.borrow_and_update() {
+                if updates.changed().await.is_err() { return; }
+            }
+            if let Err(error) = input.write_all(b"network-connected\n").await {
+                eprintln!("[MacPlay] Bluetooth discovery pause failed: {error}");
+            }
+        });
+    }
     loop {
         let accepted = tokio::select! {
             result = listener.accept() => result,
             result = child.wait() => { eprintln!("[MacPlay] Bluetooth bridge ended: {result:?}"); break; }
         };
         let Ok((mut stream, _)) = accepted else { break };
+        if cp.wireless_handoff.as_ref().is_some_and(|h| *h.connection_updates().borrow()) {
+            continue;
+        }
         if cp.ssid.is_empty() { eprintln!("[MacPlay] wireless connection refused: configure Wi-Fi first"); continue; }
         let mut header = Vec::new();
         while header.len() < 80 {

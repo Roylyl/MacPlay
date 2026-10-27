@@ -1,6 +1,6 @@
 {
   "name": "macplay",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "private": true,
   "description": "MacPlay原生macOS CarPlay接收端",
   "license": "GPL-3.0-or-later",

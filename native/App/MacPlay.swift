@@ -31,13 +31,6 @@ struct DisplayChoice: Identifiable {
 struct AudioChoice: Identifiable { let id: String; let name: String }
 
 
-struct PhoneChoice: Codable, Identifiable, Equatable {
-    var id: String
-    var name: String
-    var bluetooth: String? = nil
-    var usb: String? = nil
-}
-
 struct PlaySettings: Codable, Equatable {
     var language: String? = nil
     var autoReconnect: Bool? = nil
@@ -683,8 +676,11 @@ struct PlaySettings: Codable, Equatable {
         for device in (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []) {
             let address=device.addressString?.replacingOccurrences(of:"-",with:":").lowercased() ?? ""
             guard !address.isEmpty else {continue}
-            if device.name?.localizedCaseInsensitiveContains("iPhone") == true || choices.contains(where:{$0.bluetooth==address}) {
-                if !choices.contains(where:{$0.bluetooth==address}) {choices.append(PhoneChoice(id:address,name:device.name ?? "iPhone",bluetooth:address))}
+            let name=device.name?.trimmingCharacters(in:.whitespacesAndNewlines) ?? ""
+            if let index=choices.firstIndex(where:{$0.bluetooth?.replacingOccurrences(of:"-",with:":").lowercased()==address}) {
+                if !name.isEmpty {choices[index].name=name}
+            } else {
+                choices.append(PhoneChoice(id:address,name:name.isEmpty ? address : name,bluetooth:address))
             }
         }
         phoneChoices=choices
@@ -693,7 +689,7 @@ struct PlaySettings: Codable, Equatable {
         let hadDeferredUSB = !displayDeferredUSB.isEmpty
         displayDeferredUSB.formIntersection(serials)
         if hadDeferredUSB && displayDeferredUSB.isEmpty {status="尚未启动接收";detail="连接iPhone后启动接收端。"}
-        if changed {usbError="";usbStage=running ? "等待USB握手，请保持iPhone解锁" : "接收服务未启动"}
+        if changed && !running {usbError="";usbStage="接收服务未启动"}
         startForUSBIfNeeded(added)
     }
     var usbStatus: String {
@@ -718,18 +714,21 @@ struct PlaySettings: Codable, Equatable {
                 throw NSError(domain:"MacPlay",code:2,userInfo:[NSLocalizedDescriptionKey:"所选分辨率超过当前屏幕的可见区域，无法按物理像素比例显示。请选择较低分辨率，或使用原生像素全屏模式。"])
             }
         }
-        let selected=settings.selectedPhone ?? settings.lastPhone
-        let phone=phoneChoices.first(where:{$0.id==selected})
+        let phone: PhoneChoice?
+        if settings.wireless {
+            let selected=settings.selectedPhone ?? settings.lastPhone
+            phone=phoneChoices.first(where:{$0.id==selected})
+        } else {
+            do {
+                phone=try USBPhoneSelection.resolve(choices:phoneChoices,selectedID:settings.selectedPhone,lastID:settings.lastPhone,connectedIDs:connectedUSBIDs)
+            } catch USBPhoneSelection.Failure.ambiguous {
+                throw NSError(domain:"MacPlay",code:5,userInfo:[NSLocalizedDescriptionKey:"检测到多台USB连接的iPhone，请先选择要连接的设备。"])
+            } catch {
+                throw NSError(domain:"MacPlay",code:4,userInfo:[NSLocalizedDescriptionKey:"所选iPhone缺少当前连接方式的设备记录，请选择已配对或USB接入的设备完成首次连接。"])
+            }
+        }
         settings.targetBluetooth=phone?.bluetooth
         settings.targetUSB=phone?.usb
-        if settings.targetUSB==nil && !settings.wireless && phone==nil {
-            let usbChoices=phoneChoices.filter{phone in
-                guard let serial=phone.usb else {return false}
-                return connectedUSBIDs.contains(serial.replacingOccurrences(of:"-",with:"").lowercased())
-            }
-            if usbChoices.count>1 {throw NSError(domain:"MacPlay",code:5,userInfo:[NSLocalizedDescriptionKey:"检测到多台USB连接的iPhone，请先选择要连接的设备。"])}
-            if usbChoices.count==1 {settings.targetUSB=usbChoices.first?.usb}
-        }
         if let phone,settings.wireless ? phone.bluetooth==nil : phone.usb==nil {
             throw NSError(domain:"MacPlay",code:4,userInfo:[NSLocalizedDescriptionKey:"所选iPhone缺少当前连接方式的设备记录，请选择已配对或USB接入的设备完成首次连接。"])
         }
@@ -738,7 +737,7 @@ struct PlaySettings: Codable, Equatable {
     }
     func setAutoReconnect(_ enabled:Bool) {
         settings.autoReconnect=enabled;persistPreferences()
-        if !enabled {let waiting=reconnectCycle && !running;cancelReconnect(clearSession:!running);if waiting {status="接收已停止";detail=""}}
+        if !enabled && reconnectCycle {let waiting = !running;cancelReconnect(clearSession:!running);if waiting {status="接收已停止";detail=""}}
     }
     private func cancelReconnect(clearSession:Bool=true) {
         startRequest &+= 1;preparingConnection=false
@@ -806,7 +805,9 @@ struct PlaySettings: Codable, Equatable {
                 defer {if !self.running && self.reconnectCycle {self.scheduleReconnect()}}
                 self.preparingConnection=false
                 guard !isAutomatic || self.settings.autoReconnect == true else {return}
-                guard isFallback || isAutomatic || self.settings == snapshot else {self.networkStatus="设置已修改，请重新启动接收。";return}
+                var current=self.settings
+                current.autoReconnect=snapshot.autoReconnect
+                guard isFallback || isAutomatic || current == snapshot else {self.networkStatus="设置已修改，请重新启动接收。";return}
                 switch result {
                 case .failure:
                     self.reportStartProblem("无法确认网络接口状态","连接前网络检查超时，请重试。");if isAutomatic {self.scheduleReconnect()};return
@@ -816,6 +817,7 @@ struct PlaySettings: Codable, Equatable {
                         self.reportStartProblem("所选网络尚未连接","请检查Wi-Fi或网线连接，等待接口获得网络地址。");return
                     }
                     var prepared=snapshot
+                    prepared.autoReconnect=self.settings.autoReconnect
                     if isFallback || isAutomatic {
                         prepared.inputDevice=self.settings.inputDevice;prepared.outputDevice=self.settings.outputDevice
                         prepared.volume=self.settings.volume;prepared.callVolume=self.settings.callVolume;prepared.audioEnabled=self.settings.audioEnabled
@@ -1021,9 +1023,9 @@ struct PlaySettings: Codable, Equatable {
 }
 
 enum Page: String,CaseIterable,Identifiable {
-    case connection="连接",display="显示",audio="音频",about="关于"
+    case connection="连接",display="显示",audio="音频",about="关于",donation="捐赠"
     var id:String{rawValue}
-    var icon:String {switch self{case .connection:return "iphone.radiowaves.left.and.right";case .display:return "display";case .audio:return "speaker.wave.2";case .about:return "info.circle"}}
+    var icon:String {switch self{case .connection:return "iphone.radiowaves.left.and.right";case .display:return "display";case .audio:return "speaker.wave.2";case .about:return "info.circle";case .donation:return "heart"}}
 }
 
 struct SettingsView: View {
@@ -1158,9 +1160,11 @@ struct SettingsView: View {
                         }
                     case .about:
                         MacPlayAboutView(model:model,updates:updates)
+                    case .donation:
+                        MacPlayDonationView()
                     }
                 }.formStyle(.grouped)
-                if model.page != .about {
+                if model.page != .about && model.page != .donation {
                 Divider()
                 HStack {
                     if model.receivingOrWaiting {Button(L("停止接收")){model.stop()}}

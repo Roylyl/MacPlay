@@ -11,6 +11,7 @@ pub struct WirelessHandoff {
     connected: watch::Sender<bool>,
     deadline: Arc<Mutex<Option<Instant>>>,
     retried: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
 }
 
 impl WirelessHandoff {
@@ -21,7 +22,7 @@ impl WirelessHandoff {
             .map(|ip| ip.to_string())
             .filter(|ip| *ip != primary);
         let (connected, _) = watch::channel(false);
-        Some(Self { primary, alternate, connected, deadline: Arc::new(Mutex::new(None)), retried: Arc::new(AtomicBool::new(false)) })
+        Some(Self { primary, alternate, connected, deadline: Arc::new(Mutex::new(None)), retried: Arc::new(AtomicBool::new(false)), started: Arc::new(AtomicBool::new(false)) })
     }
 
     pub fn receiver_host(&self) -> String {
@@ -33,6 +34,12 @@ impl WirelessHandoff {
 
     pub fn connection_updates(&self) -> watch::Receiver<bool> { self.connected.subscribe() }
     pub fn network_connected(&self) { self.connected.send_replace(true); }
+
+    /// A refreshed Bluetooth channel must not start a second CarPlay session.
+    pub fn claim_start(&self) -> bool {
+        if *self.connected.borrow() { return false; }
+        self.started.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
 
     /// Repeated availability messages and overlapping Bluetooth sessions cannot reset the deadline.
     pub fn retry_deadline(&self) -> Option<Instant> {
@@ -67,13 +74,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_connection_cancels_all_waiters_even_before_negotiation() {
+    async fn confirmed_session_cancels_all_bootstrap_waiters() {
         let handoff = WirelessHandoff::new("192.0.2.10", "fe80::10").unwrap();
         let mut updates = handoff.connection_updates();
         handoff.clone().network_connected();
         updates.changed().await.unwrap();
         assert!(*updates.borrow());
         assert!(handoff.retry_deadline().is_none());
+        assert!(handoff.take_alternate().is_none());
+        assert!(!handoff.claim_start());
+    }
+
+    #[test]
+    fn refreshed_bluetooth_sessions_share_one_initial_request() {
+        let handoff = WirelessHandoff::new("192.0.2.10", "fe80::10").unwrap();
+        assert!(handoff.claim_start());
+        assert!(!handoff.clone().claim_start());
+        assert!(handoff.take_alternate().is_some());
+        assert!(!handoff.clone().claim_start());
+        handoff.network_connected();
+        assert!(!handoff.claim_start());
         assert!(handoff.take_alternate().is_none());
     }
 

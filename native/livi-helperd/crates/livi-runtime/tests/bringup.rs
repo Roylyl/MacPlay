@@ -1,6 +1,7 @@
 use tokio::sync::mpsc;
 
 use iap2_csm::messages::authentication::*;
+use iap2_csm::messages::car_play::*;
 use iap2_csm::messages::identification::*;
 use iap2_csm::messages::now_playing::*;
 use iap2_csm::messages::power::PowerSourceUpdate;
@@ -8,7 +9,7 @@ use iap2_csm::CsmMessage;
 use iap2_csm::messages::wifi::SecurityType;
 use iap2_csm::messages::location::*;
 use iap2_csm::messages::vehicle_status::*;
-use livi_runtime::bringup::{run_accessory, BringupEvent, CpConfig};
+use livi_runtime::bringup::{run_accessory, run_accessory_tunnel, BringupEvent, CpConfig};
 use livi_runtime::framing::frame_msg_id;
 use livi_runtime::ident::{Identity, Transport};
 use livi_runtime::vehicle::{Vehicle, VehicleFeed};
@@ -65,6 +66,7 @@ fn identity() -> Identity {
 
 fn cp_config() -> CpConfig {
     CpConfig {
+        wireless_handoff: None,
         ap_mac: None,
         ap_on_air: None,
         wifi_iface: "nonexistent0".into(),
@@ -249,6 +251,72 @@ async fn bring_up(phone: &mut PairChannel, rx: &mut mpsc::Receiver<BringupEvent>
         phone.expect(expected).await;
     }
     assert_eq!(rx.recv().await, Some(BringupEvent::Subscribed));
+}
+
+fn availability(available: bool) -> Vec<u8> {
+    CarPlayAvailability {
+        wired_attributes: None,
+        wireless_attributes: Some(CarPlayAvailabilityWirelessAttributes {
+            available: Some(available), bluetooth_transport_identifier: None,
+        }),
+    }.encode()
+}
+
+// Wait for a later request to be processed even when availability is intentionally ignored.
+async fn flush_phone_messages(phone: &mut PairChannel, rx: &mut mpsc::Receiver<BringupEvent>) {
+    phone.send(StartVehicleStatusUpdates {}.encode()).await.unwrap();
+    loop {
+        match rx.recv().await {
+            Some(BringupEvent::Incoming { msg_id: 0xA100, .. }) => break,
+            Some(_) => {},
+            None => panic!("accessory stopped before processing the request"),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn availability_withdrawal_cancels_the_pending_address_retry() {
+    let (accessory, mut phone) = pair();
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut cp = cp_config();
+    cp.wireless_handoff = livi_runtime::wireless_handoff::WirelessHandoff::new("192.0.2.10", "fe80::10");
+    let vehicle = Vehicle::default();
+    let handle = tokio::spawn(run_accessory(accessory, MockAuth { cert: vec![1] }, identity(), cp, tx, vehicle.feed()));
+    bring_up(&mut phone, &mut rx).await;
+    phone.send(availability(false)).await.unwrap();
+    flush_phone_messages(&mut phone, &mut rx).await;
+    assert!(phone.rx.try_recv().is_err());
+    phone.send(availability(true)).await.unwrap();
+    let start = CarPlayStartSession::decode(&phone.expect(0x4301).await).unwrap();
+    assert_eq!(start.wireless_attributes.unwrap().ip_address, vec!["192.0.2.10"]);
+    phone.send(availability(false)).await.unwrap();
+    flush_phone_messages(&mut phone, &mut rx).await;
+    tokio::time::advance(std::time::Duration::from_secs(13)).await;
+    phone.send(availability(true)).await.unwrap();
+    flush_phone_messages(&mut phone, &mut rx).await;
+    assert!(phone.rx.try_recv().is_err(), "availability must not restart the same attempt");
+    drop(phone);
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_network_tunnel_keeps_metadata_running_without_bootstrapping_again() {
+    let (accessory, mut phone) = pair();
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut cp = cp_config();
+    cp.wireless_handoff = livi_runtime::wireless_handoff::WirelessHandoff::new("192.0.2.10", "fe80::10");
+    let handle = tokio::spawn(run_accessory_tunnel(accessory, MockAuth { cert: vec![1] }, identity(), cp, tx, VehicleFeed::quiet()));
+    bring_up(&mut phone, &mut rx).await;
+    for available in [false, true, true] {
+        phone.send(availability(available)).await.unwrap();
+    }
+    flush_phone_messages(&mut phone, &mut rx).await;
+    assert!(phone.rx.try_recv().is_err(), "metadata channel must not send CarPlayStartSession");
+    let update = NowPlayingUpdate { media_item_attributes: None, playback_attributes: None }.encode();
+    phone.send(update.clone()).await.unwrap();
+    assert_eq!(rx.recv().await, Some(BringupEvent::Incoming { msg_id: 0x5001, frame: update }));
+    drop(phone);
+    handle.await.unwrap();
 }
 
 #[tokio::test]

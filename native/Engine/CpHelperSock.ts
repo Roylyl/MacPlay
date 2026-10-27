@@ -113,7 +113,7 @@ export class CpHelperSock implements MfiSigner {
     if (!response.ok) throw new CpHelperSockError(response.error)
   }
 
-  /** Cancel the pending wireless address retry as soon as a control connection arrives. */
+  /** Stop wireless bootstrap requests after the authenticated session starts receiving. */
   async networkConnected(): Promise<void> {
     const res = await this.request('network-connected')
     if (!res.ok) throw new CpHelperSockError(res.error)

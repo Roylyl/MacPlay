@@ -23,7 +23,7 @@ cat > "$RECEIVER/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.roylyl.macplay.receiver</string>
 <key>CFBundleName</key><string>MacPlay</string><key>CFBundleDisplayName</key><string>MacPlay</string>
 <key>CFBundleExecutable</key><string>MacPlayReceiver</string><key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.2.3</string><key>CFBundleVersion</key><string>39</string>
+<key>CFBundleShortVersionString</key><string>1.2.4</string><key>CFBundleVersion</key><string>41</string>
 <key>CFBundleIconFile</key><string>MacPlay</string><key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/><key>NSHighResolutionCapable</key><true/>
 <key>CFBundleLocalizations</key><array><string>en</string><string>zh-Hans</string><string>zh-Hant</string></array>
@@ -69,6 +69,8 @@ for required in "${REQUIRED_ARCHES[@]}"; do
 done
 
 cp assets/icons/mac/macplay.icns "$RES/MacPlay.icns"
+mkdir -p "$RES/donation"
+cp assets/donation/wechat.jpg assets/donation/alipay.jpg assets/donation/alipayhk.jpg "$RES/donation/"
 cp -R native/App/Resources/*.lproj "$RES/"
 cp -R native/App/Resources/*.lproj "$RECEIVER/Contents/Resources/"
 mkdir -p "$RES/icons"
@@ -85,7 +87,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.roylyl.macplay</string>
 <key>CFBundleName</key><string>MacPlay</string><key>CFBundleDisplayName</key><string>MacPlay</string>
 <key>CFBundleExecutable</key><string>MacPlay</string><key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.2.3</string><key>CFBundleVersion</key><string>39</string>
+<key>CFBundleShortVersionString</key><string>1.2.4</string><key>CFBundleVersion</key><string>41</string>
 <key>CFBundleIconFile</key><string>MacPlay</string><key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleLocalizations</key><array><string>en</string><string>zh-Hans</string><string>zh-Hant</string></array>
@@ -109,5 +111,5 @@ if [[ "${1:-}" != "--app-only" ]]; then
  rm -rf build/dmg/MacPlay.app
  ditto "$APP" build/dmg/MacPlay.app
 
- hdiutil create -ov -volname MacPlay -srcfolder build/dmg -format UDZO "dist/MacPlay-1.2.3-${TARGET_ARCH}.dmg"
+ hdiutil create -ov -volname MacPlay -srcfolder build/dmg -format UDZO "dist/MacPlay-1.2.4-${TARGET_ARCH}.dmg"
 fi

@@ -14,7 +14,7 @@ use tokio::sync::{Notify, mpsc};
 
 use iap2_link::LinkConfig;
 
-use crate::bringup::{BringupEvent, CpConfig, run_accessory};
+use crate::bringup::{BringupEvent, CpConfig, run_accessory_tunnel};
 use crate::driver::spawn_link;
 use crate::ident::Identity;
 use crate::state::HelperState;
@@ -369,7 +369,7 @@ where
         Some(resolve) => resolve(),
         None => cfg.cp,
     };
-    tokio::spawn(run_accessory(channel, auth, cfg.identity, cp, tx, vehicle));
+    tokio::spawn(run_accessory_tunnel(channel, auth, cfg.identity, cp, tx, vehicle));
     let ident: SharedTag = Arc::new(Mutex::new(events::EventTag {
         cid: (!cid.is_empty()).then_some(cid),
         ..Default::default()

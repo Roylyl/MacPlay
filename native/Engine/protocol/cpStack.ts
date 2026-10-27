@@ -340,6 +340,7 @@ export class CpStack extends EventEmitter {
         this._liveSession = null
         this.emit('session-ended')
       }
+      this.emit('connection-closed')
     })
   }
 
@@ -372,6 +373,7 @@ export class CpStack extends EventEmitter {
   private _teardown(session: CpSession): void {
     if(session.ended)return
     session.ended=true
+    if(this._active===session)this._active=null
     session.eventSock?.destroy();session.eventSock=null
     if (session.heartbeat) {
       clearInterval(session.heartbeat)
@@ -411,6 +413,12 @@ export class CpStack extends EventEmitter {
   /** The connection's stable pair-verify controller id (the CP device identity). */
   get activeControllerId(): string | null {
     return this._liveSession?.pairVerify.controllerId ?? null
+  }
+
+  /** A recorded session that passed authentication and the selected-device filter. */
+  get hasVerifiedSession(): boolean {
+    const session = this._liveSession
+    return !this._closing && !!session && !session.ended && session.pairVerify.verified && this.deviceAccepted
   }
 
   /** Sets the level of every stream of this audioType in the host. */
@@ -832,11 +840,14 @@ export class CpStack extends EventEmitter {
           const readKey = hkdfSha512(shared, 'Events-Salt', 'Events-Read-Encryption-Key', 32)
           session.eventCipher = new ControlCipher(readKey, writeKey)
         }
+        const previous = session.eventSock
         session.eventSock = s
         this._active = session
+        previous?.destroy()
         let enc: Buffer = Buffer.alloc(0)
         let plain: Buffer = Buffer.alloc(0)
         s.on('data', (chunk: Buffer) => {
+          if(session.ended || session.eventSock!==s)return
           const cipher = session.eventCipher
           if (!cipher) return
           enc = Buffer.concat([enc, chunk])
@@ -855,6 +866,7 @@ export class CpStack extends EventEmitter {
         s.on('error', () => {})
         s.on('close', () => {
           console.log('[cpStack] event channel closed')
+          if(session.eventSock!==s)return
           session.eventSock = null
           if (this._active === session) this._active = null
         })

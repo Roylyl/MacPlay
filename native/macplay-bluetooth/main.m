@@ -4,6 +4,7 @@
 #import <sys/socket.h>
 #import <sys/un.h>
 #import <unistd.h>
+#import <stdio.h>
 
 @interface Bridge : NSObject <IOBluetoothRFCOMMChannelDelegate>
 @property(nonatomic,strong) IOBluetoothRFCOMMChannel *channel;
@@ -11,15 +12,46 @@
 @property(nonatomic,strong) IOBluetoothSDPServiceRecord *carplayRecord;
 @property(nonatomic,strong) IOBluetoothUserNotification *carplayNotification;
 @property(nonatomic,strong) IOBluetoothUserNotification *notification;
-@property(nonatomic,strong) NSMutableSet *pending;
+@property(nonatomic,strong) NSMutableDictionary *pending;
 @property(nonatomic,strong) NSMutableDictionary *results;
 @property(nonatomic,assign) IOReturn advertiseResult;
 @property(nonatomic,assign) BOOL attaching;
+@property(nonatomic,assign) BOOL networkConnected;
 @property(nonatomic,assign) int fd;
 @property(nonatomic,strong) NSString *path;
 @end
 @implementation Bridge
+- (BOOL)isSelectedDevice:(IOBluetoothDevice *)device {
+    NSString *target=NSProcessInfo.processInfo.environment[@"MACPLAY_TARGET_BT"];
+    NSString *address=[device.addressString stringByReplacingOccurrencesOfString:@"-" withString:@":"];
+    return target.length && [target.lowercaseString isEqual:address.lowercaseString];
+}
+- (void)suspendConnections {
+    if(self.networkConnected) return;
+    self.networkConnected=YES;
+    [self.pending removeAllObjects];
+    // Keep an established iAP2 channel until the phone releases it. A pending
+    // outbound connection must not restart the handshake after Wi-Fi takes over.
+    if(self.channel && self.fd<0) {
+        IOBluetoothRFCOMMChannel *channel=self.channel;
+        self.channel=nil;
+        [channel closeChannel];
+    }
+    NSLog(@"MacPlay Bluetooth discovery paused: network session established");
+}
+- (void)finishChannel:(IOBluetoothRFCOMMChannel *)channel socket:(int)fd {
+    if(self.fd==fd && self.channel==channel) {
+        self.fd=-1;
+        self.channel=nil;
+        [channel closeChannel];
+    }
+    close(fd);
+}
 - (void)attach:(IOBluetoothRFCOMMChannel *)channel {
+    if(self.networkConnected) {
+        if(self.channel!=channel || self.fd<0) [channel closeChannel];
+        return;
+    }
     NSString *target=NSProcessInfo.processInfo.environment[@"MACPLAY_TARGET_BT"];
     NSString *address=[[[channel getDevice] addressString] stringByReplacingOccurrencesOfString:@"-" withString:@":"];
     if(target.length && ![target.lowercaseString isEqual:address.lowercaseString]) {[channel closeChannel];return;}
@@ -52,25 +84,56 @@
                 }
             });
         }
-        dispatch_async(dispatch_get_main_queue(), ^{ if(self.fd==fd) { self.fd=-1; close(fd); [channel closeChannel]; self.channel=nil; } });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self finishChannel:channel socket:fd]; });
     });
 }
 - (void)opened:(IOBluetoothUserNotification *)note channel:(IOBluetoothRFCOMMChannel *)channel { [self attach:channel]; }
 - (void)rfcommChannelOpenComplete:(IOBluetoothRFCOMMChannel *)channel status:(IOReturn)status {
-    [self.pending removeObject:[[channel getDevice] addressString]];
-    if(status==kIOReturnSuccess) [self attach:channel]; else { self.channel=nil; NSLog(@"MacPlay RFCOMM open error: %d",status); }
+    if(self.channel && self.channel!=channel) { [channel closeChannel]; return; }
+    [self.pending removeObjectForKey:[[channel getDevice] addressString]];
+    if(self.networkConnected) {
+        if(self.channel!=channel || self.fd<0) {
+            if(self.channel==channel) self.channel=nil;
+            [channel closeChannel];
+        }
+        return;
+    }
+    if(status==kIOReturnSuccess) [self attach:channel];
+    else {
+        [self rfcommChannelClosed:channel];
+        NSLog(@"MacPlay RFCOMM open error: %d",status);
+    }
 }
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)channel data:(void *)dataPointer length:(size_t)dataLength {
-    if(self.fd<0) return; size_t sent=0;
+    if(self.channel!=channel || self.fd<0) return; size_t sent=0;
     while(sent<dataLength) { ssize_t n=send(self.fd,(uint8_t *)dataPointer+sent,dataLength-sent,0); if(n<=0) {shutdown(self.fd,SHUT_RDWR);break;} sent+=n; }
 }
-- (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)channel { if(self.fd>=0) shutdown(self.fd,SHUT_RDWR); self.channel=nil; }
+- (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)channel {
+    if(self.channel!=channel) return;
+    if(self.fd>=0) { shutdown(self.fd,SHUT_RDWR); self.fd=-1; }
+    self.channel=nil;
+}
+- (void)expireSDPQuery:(IOBluetoothDevice *)device token:(NSString *)token {
+    if(self.networkConnected || ![self.pending[device.addressString] isEqual:token]) return;
+    [self.pending removeObjectForKey:device.addressString];
+    if([self isSelectedDevice:device]) NSLog(@"MacPlay Bluetooth SDP timed out; confirm pairing on both devices");
+    else NSLog(@"MacPlay Bluetooth device skipped after SDP timeout: %@",device.name);
+}
+- (void)queryService:(IOBluetoothDevice *)device UUID:(IOBluetoothSDPUUID *)uuid {
+    NSString *token=NSUUID.UUID.UUIDString;
+    self.pending[device.addressString]=token;
+    IOReturn status=[device performSDPQuery:self uuids:@[uuid]];
+    if(status!=kIOReturnSuccess) [self sdpQueryComplete:device status:status];
+    else dispatch_after(dispatch_time(DISPATCH_TIME_NOW,25*NSEC_PER_SEC),dispatch_get_main_queue(),^{
+        [self expireSDPQuery:device token:token];
+    });
+}
 - (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status {
-    [self.pending removeObject:[device addressString]];
-    if(self.channel) return;
+    [self.pending removeObjectForKey:[device addressString]];
+    if(self.networkConnected || self.channel) return;
     NSString *result;
     if(status!=kIOReturnSuccess) {
-        result=[NSString stringWithFormat:@"Bluetooth SDP failed for %@: %d",device.name,status];
+        result=[NSString stringWithFormat:[self isSelectedDevice:device] ? @"Bluetooth SDP failed for %@: %d" : @"Bluetooth device skipped after SDP query (%@, status=%d)",device.name,status];
         if(![self.results[device.addressString] isEqual:result]) NSLog(@"MacPlay %@",result);
         self.results[device.addressString]=result;
         return;
@@ -86,48 +149,38 @@
         if(result==kIOReturnSuccess) {
             self.channel=channel;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,15*NSEC_PER_SEC),dispatch_get_main_queue(),^{
-                if(self.channel==channel && self.fd<0) {
+                if(!self.networkConnected && self.channel==channel && self.fd<0) {
                     NSLog(@"MacPlay Bluetooth RFCOMM timed out; refreshing iPhone service records");
                     [channel closeChannel];self.channel=nil;
                     self.results[device.addressString]=@"refresh";
-                    [self.pending addObject:device.addressString];
-                    [device performSDPQuery:self uuids:@[serviceUUID]];
+                    [self queryService:device UUID:serviceUUID];
                 }
             });
         }
         else NSLog(@"MacPlay RFCOMM request failed: %d", result);
     } else {
-        result=[NSString stringWithFormat:@"Bluetooth iAP2 service unavailable for %@; open CarPlay settings on iPhone",device.name];
+        result=[NSString stringWithFormat:[self isSelectedDevice:device] ? @"Bluetooth iAP2 service unavailable for %@; open CarPlay settings on iPhone" : @"Bluetooth device skipped: %@ does not advertise iAP2",device.name];
         if(![self.results[device.addressString] isEqual:result]) NSLog(@"MacPlay %@",result);
         self.results[device.addressString]=result;
     }
 }
 - (void)scan {
-    if(self.channel) return;
+    if(self.networkConnected || self.channel) return;
     for(IOBluetoothDevice *device in [IOBluetoothDevice pairedDevices]) {
+        if(self.channel) return;
         NSString *target=NSProcessInfo.processInfo.environment[@"MACPLAY_TARGET_BT"];
         NSString *address=[device.addressString stringByReplacingOccurrencesOfString:@"-" withString:@":"];
         if(target.length && ![target.lowercaseString isEqual:address.lowercaseString]) continue;
-        if(![[device name].lowercaseString containsString:@"iphone"] || [self.pending containsObject:device.addressString]) continue;
-        [self.pending addObject:device.addressString];
+        if(!address.length || self.pending[device.addressString]) continue;
         unsigned char raw[]={0,0,0,0,0xde,0xca,0xfa,0xde,0xde,0xca,0xde,0xaf,0xde,0xca,0xca,0xfe};
         IOBluetoothSDPUUID *uuid=[IOBluetoothSDPUUID uuidWithBytes:raw length:16];
         if(![self.results[device.addressString] isEqual:@"refresh"] && [device getServiceRecordForUUID:uuid]) { [self sdpQueryComplete:device status:kIOReturnSuccess]; continue; }
-        if(!self.results[device.addressString]) {NSLog(@"MacPlay querying iPhone Bluetooth service: %@",device.name);self.results[device.addressString]=@"querying";}
-        IOReturn status=[device performSDPQuery:self uuids:@[uuid]];
-        if(status!=kIOReturnSuccess) {
-            [self.pending removeObject:device.addressString];
-            [self sdpQueryComplete:device status:status];
-        } else {
-            NSString *address=device.addressString;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,25*NSEC_PER_SEC),dispatch_get_main_queue(),^{
-                if([self.pending containsObject:address]) NSLog(@"MacPlay Bluetooth SDP timed out; confirm pairing on both devices");
-            });
-        }
+        if(!self.results[device.addressString]) {NSLog(@"MacPlay querying iAP2 Bluetooth service: %@",device.name ?: address);self.results[device.addressString]=@"querying";}
+        [self queryService:device UUID:uuid];
     }
 }
 - (void)start {
-    self.fd=-1; self.pending=[NSMutableSet set]; self.results=[NSMutableDictionary dictionary];
+    self.fd=-1; self.pending=[NSMutableDictionary dictionary]; self.results=[NSMutableDictionary dictionary];
     NSLog(@"MacPlay paired Bluetooth devices: %lu",(unsigned long)[IOBluetoothDevice pairedDevices].count);
     // Apple's public API temporarily advertises the receiver as an in-car A/V device.
     // The controller automatically restores its original class after the interval.
@@ -167,6 +220,14 @@ int main(int argc,const char **argv) { @autoreleasepool {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     Bridge *bridge=[Bridge new]; bridge.path=[NSString stringWithUTF8String:argv[1]];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+        char *line=NULL; size_t capacity=0;
+        while(getline(&line,&capacity,stdin)>=0) {
+            if(strcmp(line,"network-connected\n")==0)
+                dispatch_async(dispatch_get_main_queue(),^{[bridge suspendConnections];});
+        }
+        free(line);
+    });
     // IOBluetooth initializes CoreBluetooth synchronously and waits for callbacks.
     // Bootstrap off the main thread while AppKit services the main run loop.
     NSLog(@"MacPlay Bluetooth bridge initializing");

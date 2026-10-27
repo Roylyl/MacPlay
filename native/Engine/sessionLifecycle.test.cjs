@@ -3,12 +3,13 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
+const {EventEmitter}=require('node:events');
 const engine=path.resolve(__dirname,'../../build/engine');
 const plist=require(path.join(engine,'protocol/bplist.js'));
 
 // Exercise the control protocol without creating a real decoder or connecting
 // an iPhone. All media operations stay in this isolated module context.
-function fixture(clock=process.hrtime.bigint){
+function fixture(clock=process.hrtime.bigint,network){
  const closedVideo=[];
  const closedAudio=[],closedMicrophones=[];
  let counts=[0,0];
@@ -17,13 +18,17 @@ function fixture(clock=process.hrtime.bigint){
   closeAudioReceiver(id){closedAudio.push(id)},closeMicUplink(id){closedMicrophones.push(id)}};
  const module={exports:{}};
  const localRequire=id=>{
+  if(id==='node:net' && network)return network;
   if(id.startsWith('node:'))return require(id);
   if(id==='../media')return media;
   if(id==='./bplist')return plist;
+  if(id==='./pairSetup')return {PairSetup:class {}};
+  if(id==='./pairVerify')return {PairVerify:class {}};
   return {};
  };
  vm.runInNewContext(fs.readFileSync(path.join(engine,'protocol/cpStack.js'),'utf8'),
   {module,exports:module.exports,require:localRequire,Buffer,setImmediate,clearInterval,
+   setInterval:()=>({unref(){}}),
    process:{...process,hrtime:{bigint:clock}},
    console:{log(){},warn(){}}});
  const stack=new module.exports.CpStack({mfi:{}});
@@ -33,6 +38,75 @@ function fixture(clock=process.hrtime.bigint){
  return {stack,session,closedVideo,closedAudio,closedMicrophones,setCounts:(value)=>{counts=value}};
 }
 const turn=()=>new Promise(resolve=>setImmediate(resolve));
+
+class Socket extends EventEmitter {
+ remoteAddress='192.0.2.2';remotePort=1234;destroyed=false;
+ setKeepAlive(){}
+ destroy(){if(!this.destroyed){this.destroyed=true;setImmediate(()=>this.emit('close'))}}
+}
+
+test('closing before RECORD releases the connection without a session disconnect',async()=>{
+ const {stack}=fixture();stack._liveSession=null;
+ const socket=new Socket(),events=[];
+ stack.on('connection-closed',()=>events.push('connection-closed'));
+ stack.on('session-ended',()=>events.push('session-ended'));
+ stack.attachSocket(socket);
+ assert.equal(stack._sessionSock.size,1);
+ socket.destroy();await turn();
+ assert.deepEqual(events,['connection-closed']);
+ assert.equal(stack._sessionSock.size,0);assert.equal(stack._conns.size,0);
+});
+
+test('closing after RECORD ends the session once before releasing the connection',async()=>{
+ const {stack}=fixture();stack._liveSession=null;
+ const socket=new Socket(),events=[];
+ stack.on('connection-closed',()=>events.push('connection-closed'));
+ stack.on('session-ended',()=>events.push('session-ended'));
+ stack.attachSocket(socket);
+ stack._liveSession=[...stack._sessionSock.keys()][0];
+ socket.destroy();await turn();
+ assert.deepEqual(events,['session-ended','connection-closed']);
+ assert.equal(stack._liveSession,null);assert.equal(stack._sessionSock.size,0);
+});
+
+test('a replaced event socket cannot clear the new touch and media channel',async()=>{
+ let accept;
+ const network={createServer(callback){accept=callback;return {
+  on(){},listen(options,ready){ready()},address(){return {port:1234}},close(){}
+ }}};
+ const {stack,session}=fixture(undefined,network);session.pairVerify={};
+ await stack._openEventChannel(session);
+ const oldSocket=new Socket(),newSocket=new Socket();
+ accept(oldSocket);accept(newSocket);await turn();
+ assert.equal(oldSocket.destroyed,true);
+ assert.equal(session.eventSock,newSocket);assert.equal(stack._active,session);
+ newSocket.destroy();await turn();
+ assert.equal(session.eventSock,null);assert.equal(stack._active,null);
+});
+
+test('a TCP connection does not confirm a wireless handoff before RECORD',()=>{
+ const {stack}=fixture();
+ stack._liveSession=null;
+ assert.equal(stack.hasVerifiedSession,false);
+});
+
+test('RECORD confirms a handoff only after authentication and device selection',async()=>{
+ for(const [verified,accepted,expected] of [[false,false,false],[false,true,false],[true,false,false],[true,true,true]]) {
+  const {stack,session}=fixture();
+  session.pairVerify={verified};session.peerHost='192.0.2.2';
+  stack.deviceAccepted=accepted;stack._liveSession=null;
+  stack._openIapMessageRelay=()=>{};
+  const observed=[];
+  stack.on('session-active',()=>observed.push(stack.hasVerifiedSession));
+  const response=await stack._handle({method:'RECORD',path:'/',body:Buffer.alloc(0)},session);
+  assert.equal(response.status,200,'the handoff guard does not change RTSP compatibility');
+  assert.deepEqual(observed,[expected]);
+  session.ended=true;
+  assert.equal(stack.hasVerifiedSession,false,'an ended session cannot lock the handoff');
+  session.ended=false;stack.stop();
+  assert.equal(stack.hasVerifiedSession,false,'stopping clears the confirmed session');
+ }
+});
 
 test('CarPlay host application button requests the main window',()=>{
  const {stack,session}=fixture();let requested=0;

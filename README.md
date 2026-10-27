@@ -5,7 +5,7 @@
 <p align="center">在Mac上显示和操作iPhone的CarPlay界面，支持USB直连与局域网无线连接。</p>
 
 <p align="center">
-  <a href="scripts/package-native.sh"><img src="https://img.shields.io/badge/version-1.2.3-2563eb?style=flat-square" alt="版本1.2.3"></a>
+  <a href="scripts/package-native.sh"><img src="https://img.shields.io/badge/version-1.2.4-2563eb?style=flat-square" alt="版本1.2.4"></a>
   <a href="#使用条件"><img src="https://img.shields.io/badge/platform-macOS%2014%2B-555555?style=flat-square" alt="运行平台"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-2563eb?style=flat-square" alt="项目许可"></a>
 </p>
@@ -19,7 +19,7 @@
   <a href="https://github.com/Roylyl/MacPlay/commits"><img src="https://img.shields.io/github/last-commit/Roylyl/MacPlay?style=flat-square&amp;label=last%20commit&amp;color=555555" alt="最近提交时间"></a>
 </p>
 
-<p align="center"><a href="#快速入门">快速入门</a> · <a href="#主要功能">主要功能</a> · <a href="#其他平台">其他平台</a> · <a href="#从源码构建">源码构建</a> · <a href="#来源与许可">来源与许可</a></p>
+<p align="center"><a href="#快速入门">快速入门</a> · <a href="#主要功能">主要功能</a> · <a href="#其他平台">其他平台</a> · <a href="#从源码构建">源码构建</a> · <a href="#来源与许可">来源与许可</a> · <a href="#捐赠">捐赠</a></p>
 
 <p align="center">其他平台：<a href="https://github.com/Roylyl/WinPlay">Windows</a> · <a href="https://github.com/Roylyl/LinuxPlay">Linux</a> · <a href="https://github.com/Roylyl/AndroidPlay">Android</a></p>
 
@@ -93,6 +93,8 @@ CarPlay的“设置→显示屏→智能缩放显示”会影响图标、文字�
 
 ## 窗口与后台
 
+主窗口侧栏包含“连接”“显示”“音频”“关于”和“捐赠”。连接参数、音视频设置、版本与日志分别在对应页面管理。
+
 收到画面后自动打开CarPlay窗口，鼠标移到画面顶部可显示悬浮标题栏。关闭画面时先确认断开，断开后回到连接主页。主窗口与CarPlay共用MacPlay的Dock入口；点击CarPlay中的MacPlay图标可打开主窗口。
 
 在“连接→应用→关闭主窗口时”选择“每次询问”“保持后台运行”或“退出MacPlay”。新安装默认询问，更新安装保留原行为。后台运行时可从菜单栏图标打开窗口、启动/停止接收或退出；后台运行不等于开机启动。
@@ -107,7 +109,7 @@ CarPlay的“设置→显示屏→智能缩放显示”会影响图标、文字�
 
 ## 认证与数据
 
-1.2.3内置实验性认证材料，首次启动不覆盖本机已有身份。也可在“关于→认证文件→导入认证文件”选择匹配且获准使用的`identity.pk8`与`certificate.p7b`；普通Apple开发者签名证书不能替代配件认证。材料来源见[认证来源](assets/authentication/SOURCE.txt)。公开下载不等于取得再分发授权，公开分发前应确认材料权利。
+1.2.4内置实验性认证材料，首次启动不覆盖本机已有身份。也可在“关于→认证文件→导入认证文件”选择匹配且获准使用的`identity.pk8`与`certificate.p7b`；普通Apple开发者签名证书不能替代配件认证。材料来源见[认证来源](assets/authentication/SOURCE.txt)。公开下载不等于取得再分发授权，公开分发前应确认材料权利。
 
 设置、Wi-Fi密码、设备记录与配对身份保存在本机应用支持目录，不上传到服务器。定位权限用于读取Wi-Fi信息，蓝牙/本地网络用于连接，麦克风用于通话和语音。
 
@@ -129,11 +131,11 @@ pnpm run build -- --arch=arm64
 pnpm run build -- --arch=x64
 ~~~
 
-生成`dist/MacPlay.app`和`dist/MacPlay-1.2.3-<arch>.dmg`，架构为`arm64`或`x86_64`，包含本地签名和运行组件。
+生成`dist/MacPlay.app`和`dist/MacPlay-1.2.4-<arch>.dmg`，架构为`arm64`或`x86_64`，包含本地签名和运行组件。
 
 ## 更新日志
 
-1.2.3主要改进无线连接和音视频恢复，新增设备实时切换、接收统计、JSON诊断与主窗口关闭选项。详见[1.2.3发行说明](docs/RELEASE-1.2.3.md)和[完整更新日志](CHANGELOG.md)。
+1.2.4修复无线连接后的重复握手与断线，改善改名iPhone识别、重试和USB设备选择，并新增捐赠页。详见[1.2.4发行说明](docs/RELEASE-1.2.4.md)和[完整更新日志](CHANGELOG.md)。
 
 ## 其他平台
 
@@ -154,3 +156,22 @@ pnpm run build -- --arch=x64
 MacPlay基于[LIVI](https://github.com/f-io/LIVI)，参考[DiPlay](https://github.com/shihabal3amri/DiPlay)，保留LasseHeitgres及贡献者的版权和许可声明，见[NOTICE](NOTICE)。项目沿用GPL-3.0-or-later，见[LICENSE](LICENSE)；运行库许可位于`assets/licenses`与`assets/gstreamer/LICENSES`。
 
 第三方组件、认证文件和商标分别适用各自权利条件。MacPlay是独立衍生项目，不代表Apple或上游作者，不声称获得MFi认证。分发修改版时应保留声明并提供适用许可证要求的对应源码与构建资料。
+
+## 捐赠
+
+如果MacPlay对你有帮助，欢迎支持项目的持续维护。应用侧栏的“捐赠”页也提供以下方式，收款码可点击放大。
+
+<table>
+  <tr>
+    <th>微信支付</th>
+    <th>支付宝</th>
+    <th>AlipayHK</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="assets/donation/wechat.jpg"><img src="assets/donation/wechat.jpg" width="200" alt="微信支付收款码"></a></td>
+    <td align="center"><a href="assets/donation/alipay.jpg"><img src="assets/donation/alipay.jpg" width="200" alt="支付宝收款码"></a></td>
+    <td align="center"><a href="assets/donation/alipayhk.jpg"><img src="assets/donation/alipayhk.jpg" width="200" alt="AlipayHK收款码"></a></td>
+  </tr>
+</table>
+
+<a href="https://paypal.me/RoyRoylyl"><img src="https://img.shields.io/badge/PayPal-RoyRoylyl-0070ba?style=flat-square" alt="通过PayPal捐赠"></a>

@@ -30,7 +30,7 @@ if (!networkCheck.ok) {
 }
 diagnostic('network-validation',{interface:networkCheck.interface,families:networkCheck.families,receiverFamily:networkCheck.receiver?.family,alternate:!!networkCheck.receiver?.alternateHost})
 let discovery:Discovery|undefined
-let handoffStarted=false,networkConnected=false
+let handoffStarted=false,networkConnected=false,handoffConfirmed=false
 let disconnectReason='连接已断开'
 const videoDeadline=new VideoWaitDeadline(settings.fps>=90?25000:45000,()=>{
  if(!videoReady&&!stopping){disconnectReason=sessionReady?'CarPlay视频连接超时':'iPhone网络连接超时';diagnostic('handoff-summary',discovery?.summary());log(disconnectReason);process.stdout.write(JSON.stringify({disconnected:true,reason:disconnectReason})+'\n');shutdown()}
@@ -44,6 +44,7 @@ const icons=[256,512].map(size=>({widthPixels:size,heightPixels:size,data:fs.rea
 const helperControl=new CpHelperSock()
 const config={deviceName:'MacPlay',deviceId:accessoryDeviceId(identity.pubRaw),btMac:settings.bluetoothMAC||'02:4d:50:00:00:02',sourceVersion:'950.7.1',hevc:true,h264:true,main:displayConfig(settings),port:17000,entertainmentSampleRate:48000 as const,disableAudioOutput:!settings.audioEnabled,audioVolume:(type:number)=>type===2 ? settings.callVolume??1 : type===3 ? settings.volume??1 : 1,audioDevice:()=>settings.outputDevice||undefined,audioInputDevice:()=>settings.inputDevice||undefined,mfi:helperControl,oemLabel:'MacPlay',icons,rightHandDrive:false}
 const sessions=new Set<CpStack>()
+const controlSockets=new Set<net.Socket>()
 let active: CpStack|undefined
 let wiredReady=false
 let videoReady=false
@@ -74,7 +75,7 @@ if (!fs.existsSync(path.join(authDir,'identity.pk8')) || !fs.existsSync(path.joi
 const helper=spawn(path.join(resources,'driver/livi-helperd'),[],{env:{...process.env,MACPLAY_AUTH_DIR:authDir,MACPLAY_RECEIVER_HOST:networkCheck.receiver?.host||'',MACPLAY_RECEIVER_ALTERNATE_HOST:networkCheck.receiver?.alternateHost||'',MACPLAY_WIFI_SSID:settings.ssid||'',MACPLAY_EXTERNAL_DISCOVERY:settings.wireless?'1':'0',LIVI_CP_NAME:'MacPlay',MACPLAY_SERIAL:'MACPLAY-'+identity.pairingId.toUpperCase(),LIVI_CP_DEVICE_ID:config.deviceId,LIVI_CP_AP_MAC:settings.wireless ? settings.accessPointMAC||'' : '',LIVI_CP_BT_MAC:config.btMac,LIVI_CP_PK:identity.pkHex,LIVI_CP_PI:identity.pairingId,LIVI_CP_AIRPLAY_PORT:'17000',LIVI_CP_WIRELESS:settings.wireless?'1':'0',LIVI_WIFI_IFACE:settings.wifiInterface||'en0',MACPLAY_TARGET_BT:settings.targetBluetooth||'',MACPLAY_TARGET_USB:settings.targetUSB||'',LIVI_PASSPHRASE:settings.password||'',LIVI_CHANNEL:String(settings.channel||36)},stdio:['ignore','pipe','pipe']})
 for(const stream of [helper.stdout,helper.stderr]) readline.createInterface({input:stream!}).on('line',line=>{
  console.error(line)
- if(settings.wireless && networkConnected && line.includes('[cp-sock] listening on'))helperControl.networkConnected().catch(e=>diagnostic('network-handoff-cancel-error',String(e)))
+ if(settings.wireless && handoffConfirmed && line.includes('[cp-sock] listening on'))helperControl.networkConnected().catch(e=>diagnostic('network-handoff-cancel-error',String(e)))
  if(!videoReady && line.includes('Bluetooth SDP timed out')) log('蓝牙握手未完成','请在iPhone蓝牙页面与Mac完成配对，并确认两端配对码。')
  if(!videoReady && line.includes('Bluetooth RFCOMM timed out')) log('蓝牙重连超时','正在刷新iPhone服务信息，请保持iPhone蓝牙开启。')
  if(!videoReady && /failed|unavailable|error|refused|needs the shared/i.test(line) && !line.includes('iAP2 already runs over USB carkit')) log('连接需要检查',line)
@@ -91,18 +92,33 @@ for(const stream of [helper.stdout,helper.stderr]) readline.createInterface({inp
 helper.on('error',e=>log('连接后端启动失败',e.message))
 helper.on('exit',code=>{if(!stopping){log('连接后端已退出',String(code));process.stdout.write(JSON.stringify({disconnected:true,reason:disconnectReason})+'\n');shutdown()}})
 const server=net.createServer(socket=>{
+ if(stopping){socket.destroy();return}
+ controlSockets.add(socket)
  networkConnected=true;discovery?.networkConnected();
- if(settings.wireless)helperControl.networkConnected().catch(e=>diagnostic('network-handoff-cancel-error',String(e)));
- socket.once('close',()=>{if(!active&&!stopping){networkConnected=false;discovery?.announce()}})
  const usbSession=wiredReady && !socket.remoteAddress?.endsWith('%'+settings.wifiInterface)
  diagnostic('control-connected',{family:socket.remoteFamily});if(!videoReady)log('收到连接请求','正在协商认证与音视频')
  const stack=new CpStack(config);sessions.add(stack)
  stack.deviceFilter=id=>acceptsPhone(settings.targetBluetooth,id,!!active && active!==stack)
  stack.on('device-info',(info:{name:string;deviceId:string})=>{active=stack;phoneInfo=info})
  stack.setVideoActive(true);stack.setAudioActive(settings.audioEnabled)
- stack.on('session-active',()=>{sessionReady=true;frameRateGuard.negotiationStarted();armDeadline();stack.setStreamVolume(3,settings.volume??1,0);stack.setStreamVolume(2,settings.callVolume??1,0);if(!videoReady)log('CarPlay会话已建立','等待视频流');if(usbSession)usb('CarPlay会话已建立，等待视频流')})
- stack.on('disconnect-reason',(reason:string)=>{disconnectReason=reason})
- stack.on('session-ended',()=>{const hadVideo=videoReady;frameRateGuard.failed();sessions.delete(stack);if(active===stack){active=undefined;videoReady=false;sessionReady=false;log(disconnectReason,'重新启动接收可再次连接');if(disconnectedAfterSession(hadVideo,stopping,settings.fps)){process.stdout.write(JSON.stringify({disconnected:true,reason:disconnectReason})+'\n');shutdown()}}if(usbSession)usb('CarPlay会话已断开，可点击“应用并重新连接”')})
+ stack.on('session-active',()=>{
+  if(stopping || active!==stack)return
+  // A TCP probe must not permanently suppress Bluetooth bring-up. Confirm
+  // only after pair-verify, device selection and the session's RECORD request.
+  if(settings.wireless && !handoffConfirmed && stack.hasVerifiedSession) {
+   handoffConfirmed=true
+   helperControl.networkConnected().catch(e=>diagnostic('network-handoff-cancel-error',String(e)))
+  }
+  sessionReady=true;frameRateGuard.negotiationStarted();armDeadline();stack.setStreamVolume(3,settings.volume??1,0);stack.setStreamVolume(2,settings.callVolume??1,0);if(!videoReady)log('CarPlay会话已建立','等待视频流');if(usbSession)usb('CarPlay会话已建立，等待视频流')
+ })
+ stack.on('disconnect-reason',(reason:string)=>{if(active===stack)disconnectReason=reason})
+ stack.on('session-ended',()=>{sessions.delete(stack);if(active===stack){const hadVideo=videoReady;frameRateGuard.failed();active=undefined;phoneInfo=undefined;videoReady=false;sessionReady=false;log(disconnectReason,'重新启动接收可再次连接');if(usbSession)usb('CarPlay会话已断开，可点击“应用并重新连接”');if(disconnectedAfterSession(hadVideo,stopping,settings.fps)){process.stdout.write(JSON.stringify({disconnected:true,reason:disconnectReason})+'\n');shutdown()}}})
+ stack.on('connection-closed',()=>{
+  sessions.delete(stack);controlSockets.delete(socket)
+  if(active===stack){active=undefined;phoneInfo=undefined;sessionReady=false}
+  networkConnected=controlSockets.size>0
+  if(!networkConnected&&!active&&!stopping)discovery?.announce()
+ })
  stack.on('host-ui-requested',()=>{process.stdout.write(JSON.stringify({showMain:true})+'\n');diagnostic('show-main')})
  stack.on('error',(e:Error)=>{diagnostic('session-error',e.message);if(!videoReady)log('会话错误',e.message)})
  stack.attachSocket(socket)

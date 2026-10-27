@@ -259,6 +259,27 @@ fn wifi_config(cp: &CpConfig) -> AccessoryWiFiConfigurationInformation {
     }
 }
 
+struct StartSessionGate {
+    bootstrap: bool,
+    sent: bool,
+}
+
+fn carplay_available(transport: Transport, offer: &CarPlayAvailability) -> bool {
+    (match transport {
+        Transport::Wired => offer.wired_attributes.as_ref().and_then(|a| a.available),
+        Transport::Wireless => offer.wireless_attributes.as_ref().and_then(|a| a.available),
+    }) == Some(true)
+}
+
+impl StartSessionGate {
+    fn claim(&mut self, cp: &CpConfig, offer: &CarPlayAvailability) -> bool {
+        if !self.bootstrap || self.sent || !carplay_available(cp.transport, offer) { return false; }
+        if cp.transport == Transport::Wireless && cp.wireless_handoff.as_ref().is_some_and(|h| !h.claim_start()) { return false; }
+        self.sent = true;
+        true
+    }
+}
+
 fn carplay_start_session(cp: &CpConfig, live: OnAir) -> Option<CarPlayStartSession> {
     if cp.transport == Transport::Wired {
         // The link-local the phone connects to: the A/V interface's.
@@ -358,12 +379,29 @@ async fn wait_for_ap(cp: &CpConfig) -> OnAir {
 /// subscriptions, then the request/response phase (Wi-Fi config, CarPlayStartSession),
 /// emitting progress and every subsequent incoming message id over `events`.
 pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
+    ch: C, auth: A, id: Identity, cp: CpConfig,
+    events: mpsc::Sender<BringupEvent>, vehicle: VehicleFeed,
+) {
+    run_accessory_session(ch, auth, id, cp, events, vehicle, true).await;
+}
+
+/// iAP2 over an established CarPlay network session carries metadata and controls;
+/// it must never ask the phone to replace that session with another one.
+pub async fn run_accessory_tunnel<C: ControlChannel, A: AsyncAuth>(
+    ch: C, auth: A, id: Identity, cp: CpConfig,
+    events: mpsc::Sender<BringupEvent>, vehicle: VehicleFeed,
+) {
+    run_accessory_session(ch, auth, id, cp, events, vehicle, false).await;
+}
+
+async fn run_accessory_session<C: ControlChannel, A: AsyncAuth>(
     mut ch: C,
     mut auth: A,
     id: Identity,
     cp: CpConfig,
     events: mpsc::Sender<BringupEvent>,
     mut vehicle: VehicleFeed,
+    bootstrap: bool,
 ) {
     if let Err(e) = run_identification(&mut ch, &id, cp.transport).await {
         let _ = events.send(BringupEvent::Failed(e.to_string())).await;
@@ -398,6 +436,8 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
 
     let mut phone_tag=crate::events::EventTag::default();
     let mut seek_feed_open=true;
+    let mut location_feed_open=true;
+    let mut status_feed_open=true;
     let mut can_seek=false;
     let mut track_id: Option<String>=None;
     let mut duration: Option<u32>=None;
@@ -409,6 +449,7 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
     let mut connection_feed_open = handoff.is_some();
     let mut fallback_deadline: Option<Instant> = None;
     let mut fallback_message: Option<CarPlayStartSession> = None;
+    let mut start_gate = StartSessionGate { bootstrap, sent: false };
     loop {
         let frame = tokio::select! {
             changed = connection_updates.changed(), if connection_feed_open => {
@@ -444,8 +485,9 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
                 }
                 continue;
             }
-            changed = vehicle.location.changed() => {
+            changed = vehicle.location.changed(), if location_feed_open => {
                 if changed.is_err() {
+                    location_feed_open = false;
                     continue;
                 }
                 let nmea = vehicle.location.borrow_and_update().1.clone();
@@ -454,8 +496,9 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
                 }
                 continue;
             }
-            changed = vehicle.status.changed() => {
+            changed = vehicle.status.changed(), if status_feed_open => {
                 if changed.is_err() {
+                    status_feed_open = false;
                     continue;
                 }
                 let status = vehicle.status.borrow_and_update().clone();
@@ -513,6 +556,22 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
                 let _ = events.send(BringupEvent::WifiConfigSent).await;
             }
             0x4300 => {
+                let offer = match CarPlayAvailability::decode(&frame) {
+                    Ok(offer) => offer,
+                    Err(e) => {
+                        fallback_deadline = None;
+                        fallback_message = None;
+                        println!("[cp] CarPlayAvailability undecodable: {e}");
+                        continue;
+                    }
+                };
+                println!("[cp] CarPlayAvailability wired={:?} wireless={:?}", offer.wired_attributes, offer.wireless_attributes);
+                if !carplay_available(cp.transport, &offer) {
+                    fallback_deadline = None;
+                    fallback_message = None;
+                    continue;
+                }
+                if !start_gate.bootstrap || start_gate.sent { continue; }
                 let live = if cp.transport == Transport::Wired {
                     (None, None)
                 } else {
@@ -520,14 +579,8 @@ pub async fn run_accessory<C: ControlChannel, A: AsyncAuth>(
                 };
                 match carplay_start_session(&cp, live) {
                     Some(start) => {
-                        // Logs the phone's offer and our answer.
-                        match CarPlayAvailability::decode(&frame) {
-                            Ok(a) => println!(
-                                "[cp] CarPlayAvailability wired={:?} wireless={:?}",
-                                a.wired_attributes, a.wireless_attributes
-                            ),
-                            Err(e) => println!("[cp] CarPlayAvailability undecodable: {e}"),
-                        }
+                        // Recheck shared state after awaiting network parameters.
+                        if !start_gate.claim(&cp, &offer) { continue; }
                         let ip = start
                             .wireless_attributes
                             .as_ref()
@@ -619,6 +672,54 @@ mod tests {
             ap_on_air: Some(ask),
             wireless_handoff: None,
         }
+    }
+
+    fn offer(wired: Option<bool>, wireless: Option<bool>) -> CarPlayAvailability {
+        CarPlayAvailability {
+            wired_attributes: Some(CarPlayAvailabilityWiredAttributes { available: wired, usb_transport_identifier: None }),
+            wireless_attributes: Some(CarPlayAvailabilityWirelessAttributes { available: wireless, bluetooth_transport_identifier: None }),
+        }
+    }
+
+    #[test]
+    fn starts_only_when_the_current_transport_is_available() {
+        let mut cp = dongle_ap(|| None);
+        let mut gate = StartSessionGate { bootstrap: true, sent: false };
+        for advertised in [offer(Some(true), Some(false)), offer(Some(true), None)] {
+            let decoded = CarPlayAvailability::decode(&advertised.encode()).unwrap();
+            assert!(!gate.claim(&cp, &decoded));
+        }
+        assert!(gate.claim(&cp, &offer(Some(false), Some(true))));
+        assert!(!gate.claim(&cp, &offer(Some(false), Some(true))));
+        cp.transport = Transport::Wired;
+        let mut wired = StartSessionGate { bootstrap: true, sent: false };
+        assert!(!wired.claim(&cp, &offer(Some(false), Some(true))));
+        assert!(wired.claim(&cp, &offer(Some(true), Some(false))));
+    }
+
+    #[test]
+    fn metadata_tunnel_never_restarts_carplay_even_when_advertised_available() {
+        let mut cp = dongle_ap(|| None);
+        for transport in [Transport::Wireless, Transport::Wired] {
+            cp.transport = transport;
+            let mut gate = StartSessionGate { bootstrap: false, sent: false };
+            assert!(!gate.claim(&cp, &offer(Some(true), Some(true))));
+            assert!(!gate.claim(&cp, &offer(Some(false), Some(false))));
+        }
+    }
+
+    #[test]
+    fn new_bluetooth_channel_cannot_restart_an_existing_wireless_session() {
+        let mut cp = dongle_ap(|| None);
+        cp.wireless_handoff = crate::wireless_handoff::WirelessHandoff::new("192.0.2.10", "fe80::10");
+        let mut first = StartSessionGate { bootstrap: true, sent: false };
+        assert!(first.claim(&cp, &offer(None, Some(true))));
+        let mut refreshed = StartSessionGate { bootstrap: true, sent: false };
+        assert!(!refreshed.claim(&cp.clone(), &offer(None, Some(true))));
+        cp.wireless_handoff.as_ref().unwrap().network_connected();
+        assert!(!refreshed.claim(&cp, &offer(None, Some(true))));
+        cp.transport = Transport::Wired;
+        assert!(refreshed.claim(&cp, &offer(Some(true), None)));
     }
 
     #[test]
